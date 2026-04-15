@@ -75,6 +75,9 @@ export class SyncEngine {
 			const localPathSet = new Set(localPaths);
 			this.stats.totalFiles = localPaths.length;
 
+			// 0. Handle Remote Deletions
+			await this.handleRemoteDeletions(remoteMap);
+
 			// 1. Handle Deletions
 			this.updateStatus('Checking for deletions...');
 			const stateEntries = Object.entries(this.stateManager.state);
@@ -88,12 +91,12 @@ export class SyncEngine {
 						this.stateManager.remove(path);
 						remoteMap.delete(path);
 					} catch (e) {
-						console.error(`Failed to delete remote ${path}`, e);
 						// If already deleted or folder is gone, just remove from state
-						if (e.status === 404 || e.message.includes('404')) {
+						if (e.status === 404 || e.message?.includes('404')) {
 							this.stateManager.remove(path);
 							remoteMap.delete(path);
 						} else {
+							console.error(`Failed to delete remote ${path}`, e);
 							this.stats.failed++;
 							this.stats.errors.push({ path, message: e.message });
 						}
@@ -110,7 +113,7 @@ export class SyncEngine {
 					await this.processRemoteFile(path, remoteFile);
 				} catch (e) {
 					console.error(`Failed to pull ${path}`, e);
-					if (e.status === 404 || e.message.includes('404')) {
+					if (e.status === 404 || e.message?.includes('404')) {
 						this.stateManager.remove(path);
 					} else {
 						this.stats.failed++;
@@ -166,6 +169,8 @@ export class SyncEngine {
 	private isExcluded(path: string): boolean {
 		return path.startsWith('.git/') || 
 			   path === '.git' || 
+			   path.startsWith('.trash/') ||
+			   path === '.trash' ||
 			   path === '.obsidian/gdrive-sync.json' ||
 			   path.includes('/.git/');
 	}
@@ -287,6 +292,7 @@ export class SyncEngine {
 			for (const item of items) {
 				const path = parentPath ? `${parentPath}/${item.name}` : item.name;
 				if (item.mimeType === 'application/vnd.google-apps.folder') {
+					map.set(path, item);
 					const subMap = await this.buildRemoteMap(item.id, path, depth + 1);
 					for (const [subPath, subFile] of subMap) {
 						map.set(subPath, subFile);
@@ -325,6 +331,19 @@ export class SyncEngine {
 	}
 
 	private async processRemoteFile(path: string, remoteFile: DriveFile) {
+		if (remoteFile.mimeType === 'application/vnd.google-apps.folder') {
+			await this.ensureLocalPath(path);
+			const state = this.stateManager.get(path);
+			this.stateManager.set(path, {
+				driveId: remoteFile.id,
+				lastSyncedMtime: state ? state.lastSyncedMtime : 0,
+				remoteMtime: remoteFile.modifiedTime,
+				etag: ''
+			});
+			await this.stateManager.save();
+			return;
+		}
+
 		const state = this.stateManager.get(path);
 		const existsLocal = await this.app.vault.adapter.exists(path);
 
@@ -373,6 +392,43 @@ export class SyncEngine {
 				}
 			} else {
 				await this.download(path, remoteFile);
+			}
+		}
+	}
+
+	private async handleRemoteDeletions(remoteMap: Map<string, DriveFile>) {
+		const stateEntries = Object.entries(this.stateManager.state);
+		// Sort by path length descending to handle children before parents
+		const sortedEntries = stateEntries
+			.filter(([path]) => path !== '__VAULT_ROOT__' && !this.isExcluded(path))
+			.sort((a, b) => b[0].length - a[0].length);
+
+		for (const [path, entry] of sortedEntries) {
+			if (!remoteMap.has(path)) {
+				try {
+					if (await this.app.vault.adapter.exists(path)) {
+						this.updateStatus(`Deleting local: ${path}`);
+						const stat = await this.app.vault.adapter.stat(path);
+						if (stat?.type === 'folder') {
+							// Use rmdir for folders. Recursive: false because we handle children individually
+							// due to the sorted loop.
+							await (this.app.vault.adapter as any).rmdir(path, false).catch(async (err: any) => {
+								// If rmdir fails because it's not empty (shouldn't happen with our sorting, 
+								// but safety first), try recursive if it's not a critical folder.
+								if (!path.startsWith('.obsidian/')) {
+									await (this.app.vault.adapter as any).rmdir(path, true);
+								}
+							});
+						} else {
+							await this.app.vault.adapter.remove(path);
+						}
+					}
+					this.stateManager.remove(path);
+				} catch (e) {
+					console.error(`Failed to delete local ${path}`, e);
+					this.stats.failed++;
+					this.stats.errors.push({ path, message: e.message });
+				}
 			}
 		}
 	}

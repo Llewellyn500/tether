@@ -434,6 +434,7 @@ var SyncEngine = class {
     }
   }
   async sync() {
+    var _a, _b;
     if (!this.folderId) {
       new import_obsidian4.Notice("Google Drive folder ID not set.");
       return;
@@ -455,6 +456,7 @@ var SyncEngine = class {
       const localPaths = await this.listAllLocalItems("");
       const localPathSet = new Set(localPaths);
       this.stats.totalFiles = localPaths.length;
+      await this.handleRemoteDeletions(remoteMap);
       this.updateStatus("Checking for deletions...");
       const stateEntries = Object.entries(this.stateManager.state);
       for (const [path, entry] of stateEntries) {
@@ -467,11 +469,11 @@ var SyncEngine = class {
             this.stateManager.remove(path);
             remoteMap.delete(path);
           } catch (e) {
-            console.error(`Failed to delete remote ${path}`, e);
-            if (e.status === 404 || e.message.includes("404")) {
+            if (e.status === 404 || ((_a = e.message) == null ? void 0 : _a.includes("404"))) {
               this.stateManager.remove(path);
               remoteMap.delete(path);
             } else {
+              console.error(`Failed to delete remote ${path}`, e);
               this.stats.failed++;
               this.stats.errors.push({ path, message: e.message });
             }
@@ -487,7 +489,7 @@ var SyncEngine = class {
           await this.processRemoteFile(path, remoteFile);
         } catch (e) {
           console.error(`Failed to pull ${path}`, e);
-          if (e.status === 404 || e.message.includes("404")) {
+          if (e.status === 404 || ((_b = e.message) == null ? void 0 : _b.includes("404"))) {
             this.stateManager.remove(path);
           } else {
             this.stats.failed++;
@@ -532,7 +534,7 @@ var SyncEngine = class {
     }
   }
   isExcluded(path) {
-    return path.startsWith(".git/") || path === ".git" || path === ".obsidian/gdrive-sync.json" || path.includes("/.git/");
+    return path.startsWith(".git/") || path === ".git" || path.startsWith(".trash/") || path === ".trash" || path === ".obsidian/gdrive-sync.json" || path.includes("/.git/");
   }
   async listAllLocalItems(folderPath) {
     const items = [];
@@ -634,6 +636,7 @@ var SyncEngine = class {
       for (const item of items) {
         const path = parentPath ? `${parentPath}/${item.name}` : item.name;
         if (item.mimeType === "application/vnd.google-apps.folder") {
+          map.set(path, item);
           const subMap = await this.buildRemoteMap(item.id, path, depth + 1);
           for (const [subPath, subFile] of subMap) {
             map.set(subPath, subFile);
@@ -668,6 +671,18 @@ var SyncEngine = class {
     return newFolder.id;
   }
   async processRemoteFile(path, remoteFile) {
+    if (remoteFile.mimeType === "application/vnd.google-apps.folder") {
+      await this.ensureLocalPath(path);
+      const state2 = this.stateManager.get(path);
+      this.stateManager.set(path, {
+        driveId: remoteFile.id,
+        lastSyncedMtime: state2 ? state2.lastSyncedMtime : 0,
+        remoteMtime: remoteFile.modifiedTime,
+        etag: ""
+      });
+      await this.stateManager.save();
+      return;
+    }
     const state = this.stateManager.get(path);
     const existsLocal = await this.app.vault.adapter.exists(path);
     if (!state) {
@@ -711,6 +726,34 @@ var SyncEngine = class {
         }
       } else {
         await this.download(path, remoteFile);
+      }
+    }
+  }
+  async handleRemoteDeletions(remoteMap) {
+    const stateEntries = Object.entries(this.stateManager.state);
+    const sortedEntries = stateEntries.filter(([path]) => path !== "__VAULT_ROOT__" && !this.isExcluded(path)).sort((a, b) => b[0].length - a[0].length);
+    for (const [path, entry] of sortedEntries) {
+      if (!remoteMap.has(path)) {
+        try {
+          if (await this.app.vault.adapter.exists(path)) {
+            this.updateStatus(`Deleting local: ${path}`);
+            const stat = await this.app.vault.adapter.stat(path);
+            if ((stat == null ? void 0 : stat.type) === "folder") {
+              await this.app.vault.adapter.rmdir(path, false).catch(async (err) => {
+                if (!path.startsWith(".obsidian/")) {
+                  await this.app.vault.adapter.rmdir(path, true);
+                }
+              });
+            } else {
+              await this.app.vault.adapter.remove(path);
+            }
+          }
+          this.stateManager.remove(path);
+        } catch (e) {
+          console.error(`Failed to delete local ${path}`, e);
+          this.stats.failed++;
+          this.stats.errors.push({ path, message: e.message });
+        }
       }
     }
   }
