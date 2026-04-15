@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, setIcon } from 'obsidian';
+import { ItemView, WorkspaceLeaf, setIcon, TFile } from 'obsidian';
 
 export const VIEW_TYPE_SYNC_STATUS = 'gdrive-sync-status-view';
 
@@ -78,9 +78,37 @@ export class SyncStatusView extends ItemView {
 				info.createEl('b', { text: conflict.path.split('/').pop() || conflict.path });
 				info.createEl('p', { text: `Original: ${conflict.originalPath}`, cls: 'conflict-original-path' });
 				
-				const btn = item.createEl('button', { text: 'Open', cls: 'mod-cta conflict-open-btn' });
-				btn.onClickEvent(() => {
-					this.app.workspace.openLinkText(conflict.path, '', true);
+				const btnContainer = item.createDiv({ cls: 'conflict-buttons' });
+				
+				const openBtn = btnContainer.createEl('button', { text: 'Open', cls: 'mod-cta conflict-open-btn' });
+				openBtn.onClickEvent(async () => {
+					try {
+						const file = this.app.vault.getAbstractFileByPath(conflict.path);
+						if (file instanceof TFile) {
+							await this.app.workspace.getLeaf(true).openFile(file);
+						} else if (conflict.path.startsWith('.obsidian/')) {
+							new Notice('Cannot open hidden config files directly in the editor. Please use an external editor or a File Explorer plugin to view this file.');
+						} else {
+							await this.app.workspace.openLinkText(conflict.path, '', true);
+						}
+					} catch (e) {
+						console.error('Failed to open conflict file', e);
+						new Notice('Failed to open file: ' + e.message);
+					}
+				});
+
+				const delBtn = btnContainer.createEl('button', { text: 'Delete', cls: 'mod-warning conflict-del-btn' });
+				delBtn.onClickEvent(async () => {
+					if (confirm(`Are you sure you want to delete this conflict file?\n${conflict.path}`)) {
+						try {
+							await this.app.vault.adapter.remove(conflict.path);
+							this.stats.conflicts = this.stats.conflicts.filter(c => c.path !== conflict.path);
+							this.render();
+							new Notice('Conflict file deleted.');
+						} catch (e) {
+							new Notice('Failed to delete file: ' + e.message);
+						}
+					}
 				});
 			});
 		}

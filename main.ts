@@ -34,11 +34,11 @@ const DEFAULT_SETTINGS: GoogleDriveSyncSettings = {
 }
 
 export default class GoogleDriveSyncPlugin extends Plugin {
-	settings: GoogleDriveSyncSettings;
-	stateManager: StateManager;
-	client: GoogleDriveClient;
-	syncEngine: SyncEngine;
-	statusBarItem: HTMLElement;
+	settings!: GoogleDriveSyncSettings;
+	stateManager!: StateManager;
+	client!: GoogleDriveClient;
+	syncEngine!: SyncEngine;
+	statusBarItem!: HTMLElement;
 	isSyncing: boolean = false;
 
 	async onload() {
@@ -108,6 +108,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 			leaf = leaves[0];
 		} else {
 			leaf = workspace.getRightLeaf(false);
+			if (!leaf) return;
 			await leaf.setViewState({ type: VIEW_TYPE_SYNC_STATUS, active: true });
 		}
 
@@ -186,7 +187,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 			await this.syncEngine.sync();
 		} catch (error) {
 			console.error('Sync failed', error);
-			new Notice(`Sync failed: ${error.message}`);
+			new Notice(`Sync failed: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
 			this.isSyncing = false;
 		}
@@ -245,7 +246,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 			new Notice(`Successfully logged in as ${userInfo.email}!`);
 		} catch (error) {
 			console.error('Login failed', error);
-			new Notice('Login failed: ' + error.message);
+			new Notice('Login failed: ' + (error instanceof Error ? error.message : String(error)));
 		}
 	}
 }
@@ -374,10 +375,10 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 		new Setting(step3)
 			.setName(hasFolder ? 'Folder Selected ✓' : 'Select Sync Folder')
 			.setDesc(hasFolder ? `Syncing with: ${this.plugin.settings.folderName}` : 'Choose where to sync your notes.')
-			.addButton(btn => btn
-				.setButtonText(hasFolder ? 'Change Folder' : 'Select Folder')
-				.setCta(!hasFolder)
-				.onClick(() => {
+			.addButton(btn => {
+				btn.setButtonText(hasFolder ? 'Change Folder' : 'Select Folder');
+				if (!hasFolder) btn.setCta();
+				btn.onClick(() => {
 					new FolderSuggestModal(this.app, this.plugin.client, async (folder) => {
 						this.plugin.settings.folderId = folder.id;
 						this.plugin.settings.folderName = folder.name;
@@ -386,7 +387,8 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 						new Notice(`Sync folder set to ${folder.name}.`);
 						this.plugin.manualSync();
 					}).open();
-				}));
+				});
+			});
 
 		if (!hasFolder) return;
 

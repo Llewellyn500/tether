@@ -137,7 +137,8 @@ var GoogleDriveClient = class {
     try {
       response = await (0, import_obsidian2.requestUrl)(options);
     } catch (error) {
-      if (error.status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
+      const status = error instanceof Object && "status" in error ? error.status : void 0;
+      if (status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
         return await this.handleRefresh(options);
       }
       throw error;
@@ -149,12 +150,14 @@ var GoogleDriveClient = class {
       let message = response.text || `Status ${response.status}`;
       try {
         const json = JSON.parse(response.text);
-        if (json.error && json.json.error.message) {
+        if (json.error && json.error.message) {
           message = json.error.message;
         }
       } catch (e) {
       }
-      throw new Error(`Google Drive API Error: ${message} (Status ${response.status})`);
+      const error = new Error(`Google Drive API Error: ${message}`);
+      error.status = response.status;
+      throw error;
     }
     return response;
   }
@@ -352,9 +355,12 @@ var SyncEngine = class {
             remoteMap.delete(path);
           } catch (e) {
             console.error(`Failed to delete remote ${path}`, e);
-            if (e.message.includes("404")) {
+            if (e.status === 404 || e.message.includes("404")) {
               this.stateManager.remove(path);
               remoteMap.delete(path);
+            } else {
+              this.stats.failed++;
+              this.stats.errors.push({ path, message: e.message });
             }
           }
         }
@@ -368,8 +374,12 @@ var SyncEngine = class {
           await this.processRemoteFile(path, remoteFile);
         } catch (e) {
           console.error(`Failed to pull ${path}`, e);
-          this.stats.failed++;
-          this.stats.errors.push({ path, message: e.message });
+          if (e.status === 404 || e.message.includes("404")) {
+            this.stateManager.remove(path);
+          } else {
+            this.stats.failed++;
+            this.stats.errors.push({ path, message: e.message });
+          }
         }
         this.updateStatus(this.stats.status);
       }
@@ -384,8 +394,12 @@ var SyncEngine = class {
           await this.processLocalPath(path, vaultRootDriveId);
         } catch (e) {
           console.error(`Failed to push ${path}`, e);
-          this.stats.failed++;
-          this.stats.errors.push({ path, message: e.message });
+          if (e.status === 404 || e.message.includes("404")) {
+            this.stateManager.remove(path);
+          } else {
+            this.stats.failed++;
+            this.stats.errors.push({ path, message: e.message });
+          }
         }
         this.updateStatus(this.stats.status);
       }
@@ -584,13 +598,25 @@ var SyncEngine = class {
     const parent = parts.slice(0, -1).join("/");
     if (parent)
       await this.ensureLocalPath(parent);
-    await this.app.vault.adapter.mkdir(path);
+    try {
+      await this.app.vault.adapter.mkdir(path);
+    } catch (e) {
+      const msg = (e.message || e.toString()).toLowerCase();
+      if (!msg.includes("already exists")) {
+        throw e;
+      }
+    }
   }
   async handleConflict(path, remoteFile) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const lastDotIndex = path.lastIndexOf(".");
     const conflictPath = lastDotIndex !== -1 ? path.slice(0, lastDotIndex) + ` (conflict ${timestamp})` + path.slice(lastDotIndex) : `${path} (conflict ${timestamp})`;
     const content = await this.client.downloadFile(remoteFile.id);
+    const parts = conflictPath.split("/");
+    if (parts.length > 1) {
+      const folderPath = parts.slice(0, -1).join("/");
+      await this.ensureLocalPath(folderPath);
+    }
     await this.app.vault.adapter.writeBinary(conflictPath, content);
     new import_obsidian3.Notice(`Conflict detected for ${path}. Kept both versions.`);
     this.stats.conflicts.push({
@@ -741,8 +767,7 @@ var SetupGuideModal = class extends import_obsidian5.Modal {
     const stepsContainer = contentEl.createDiv({ cls: "setup-steps-scroll" });
     stepsContainer.setAttr("style", "max-height: 70vh; overflow-y: auto; padding-right: 10px; margin-bottom: 20px;");
     const steps = [
-      "Navigate to https://github.com/Llewellyn500/tether",
-      'Click "Google Cloud Console"',
+      `Navigate to 'https://console.cloud.google.com/"`,
       'Click "Select a project"',
       'Click "New project"',
       'Type "Tether-Sync"',
@@ -889,9 +914,36 @@ var SyncStatusView = class extends import_obsidian6.ItemView {
         const info = item.createDiv({ cls: "conflict-info" });
         info.createEl("b", { text: conflict.path.split("/").pop() || conflict.path });
         info.createEl("p", { text: `Original: ${conflict.originalPath}`, cls: "conflict-original-path" });
-        const btn = item.createEl("button", { text: "Open", cls: "mod-cta conflict-open-btn" });
-        btn.onClickEvent(() => {
-          this.app.workspace.openLinkText(conflict.path, "", true);
+        const btnContainer = item.createDiv({ cls: "conflict-buttons" });
+        const openBtn = btnContainer.createEl("button", { text: "Open", cls: "mod-cta conflict-open-btn" });
+        openBtn.onClickEvent(async () => {
+          try {
+            const file = this.app.vault.getAbstractFileByPath(conflict.path);
+            if (file instanceof import_obsidian6.TFile) {
+              await this.app.workspace.getLeaf(true).openFile(file);
+            } else if (conflict.path.startsWith(".obsidian/")) {
+              new Notice("Cannot open hidden config files directly in the editor. Please use an external editor or a File Explorer plugin to view this file.");
+            } else {
+              await this.app.workspace.openLinkText(conflict.path, "", true);
+            }
+          } catch (e) {
+            console.error("Failed to open conflict file", e);
+            new Notice("Failed to open file: " + e.message);
+          }
+        });
+        const delBtn = btnContainer.createEl("button", { text: "Delete", cls: "mod-warning conflict-del-btn" });
+        delBtn.onClickEvent(async () => {
+          if (confirm(`Are you sure you want to delete this conflict file?
+${conflict.path}`)) {
+            try {
+              await this.app.vault.adapter.remove(conflict.path);
+              this.stats.conflicts = this.stats.conflicts.filter((c) => c.path !== conflict.path);
+              this.render();
+              new Notice("Conflict file deleted.");
+            } catch (e) {
+              new Notice("Failed to delete file: " + e.message);
+            }
+          }
         });
       });
     }

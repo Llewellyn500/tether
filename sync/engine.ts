@@ -87,9 +87,12 @@ export class SyncEngine {
 					} catch (e) {
 						console.error(`Failed to delete remote ${path}`, e);
 						// If already deleted or folder is gone, just remove from state
-						if (e.message.includes('404') || e.status === 404) {
+						if (e.status === 404 || e.message.includes('404')) {
 							this.stateManager.remove(path);
 							remoteMap.delete(path);
+						} else {
+							this.stats.failed++;
+							this.stats.errors.push({ path, message: e.message });
 						}
 					}
 				}
@@ -104,8 +107,12 @@ export class SyncEngine {
 					await this.processRemoteFile(path, remoteFile);
 				} catch (e) {
 					console.error(`Failed to pull ${path}`, e);
-					this.stats.failed++;
-					this.stats.errors.push({ path, message: e.message });
+					if (e.status === 404 || e.message.includes('404')) {
+						this.stateManager.remove(path);
+					} else {
+						this.stats.failed++;
+						this.stats.errors.push({ path, message: e.message });
+					}
 				}
 				this.updateStatus(this.stats.status);
 			}
@@ -125,11 +132,13 @@ export class SyncEngine {
 					console.error(`Failed to push ${path}`, e);
 					// If the file/folder we are trying to update was deleted on remote, 
 					// clear the state so the next sync treats it as a new upload.
-					if (e.message.includes('404') || e.status === 404) {
+					if (e.status === 404 || e.message.includes('404')) {
 						this.stateManager.remove(path);
+						// Not a "failure" per se, just an out-of-sync state we recovered from
+					} else {
+						this.stats.failed++;
+						this.stats.errors.push({ path, message: e.message });
 					}
-					this.stats.failed++;
-					this.stats.errors.push({ path, message: e.message });
 				}
 				this.updateStatus(this.stats.status);
 			}
@@ -318,14 +327,31 @@ export class SyncEngine {
 
 		if (!state) {
 			if (existsLocal) {
-				await this.handleConflict(path, remoteFile);
+				const stat = await this.app.vault.adapter.stat(path);
+				if (path.startsWith('.obsidian/') && stat) {
+					const remoteTime = new Date(remoteFile.modifiedTime).getTime();
+					if (remoteTime > stat.mtime) {
+						await this.download(path, remoteFile);
+					}
+					// If local is newer, do nothing; processLocalPath will handle the upload
+				} else {
+					await this.handleConflict(path, remoteFile);
+				}
 			} else {
 				await this.download(path, remoteFile);
 			}
 		} else if (remoteFile.modifiedTime !== state.remoteMtime) {
 			const stat = await this.app.vault.adapter.stat(path);
 			if (stat && stat.mtime > state.lastSyncedMtime) {
-				await this.handleConflict(path, remoteFile);
+				if (path.startsWith('.obsidian/')) {
+					const remoteTime = new Date(remoteFile.modifiedTime).getTime();
+					if (remoteTime > stat.mtime) {
+						await this.download(path, remoteFile);
+					}
+					// If local is newer, do nothing; processLocalPath will handle the upload
+				} else {
+					await this.handleConflict(path, remoteFile);
+				}
 			} else {
 				await this.download(path, remoteFile);
 			}
@@ -361,7 +387,14 @@ export class SyncEngine {
 		const parent = parts.slice(0, -1).join('/');
 		if (parent) await this.ensureLocalPath(parent);
 		
-		await this.app.vault.adapter.mkdir(path);
+		try {
+			await this.app.vault.adapter.mkdir(path);
+		} catch (e) {
+			const msg = (e.message || e.toString()).toLowerCase();
+			if (!msg.includes('already exists')) {
+				throw e;
+			}
+		}
 	}
 
 	private async handleConflict(path: string, remoteFile: DriveFile) {
@@ -372,6 +405,13 @@ export class SyncEngine {
 			: `${path} (conflict ${timestamp})`;
 		
 		const content = await this.client.downloadFile(remoteFile.id);
+		
+		const parts = conflictPath.split('/');
+		if (parts.length > 1) {
+			const folderPath = parts.slice(0, -1).join('/');
+			await this.ensureLocalPath(folderPath);
+		}
+
 		await this.app.vault.adapter.writeBinary(conflictPath, content);
 		
 		new Notice(`Conflict detected for ${path}. Kept both versions.`);

@@ -29,8 +29,9 @@ export class GoogleDriveClient {
 		let response;
 		try {
 			response = await requestUrl(options);
-		} catch (error) {
-			if (error.status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
+		} catch (error: unknown) {
+			const status = error instanceof Object && 'status' in error ? (error as any).status : undefined;
+			if (status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
 				return await this.handleRefresh(options);
 			}
 			throw error;
@@ -44,13 +45,15 @@ export class GoogleDriveClient {
 			let message = response.text || `Status ${response.status}`;
 			try {
 				const json = JSON.parse(response.text);
-				if (json.error && json.json.error.message) {
+				if (json.error && json.error.message) {
 					message = json.error.message;
 				}
 			} catch (e) {
 				// Not JSON or missing message
 			}
-			throw new Error(`Google Drive API Error: ${message} (Status ${response.status})`);
+			const error: any = new Error(`Google Drive API Error: ${message}`);
+			error.status = response.status;
+			throw error;
 		}
 		return response;
 	}
