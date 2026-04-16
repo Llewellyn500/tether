@@ -47,10 +47,14 @@ Tether includes a **Setup Wizard** in the settings tab to guide you through thes
 ### Step 1: Create Google Cloud Credentials (Google Cloud Console)
 
 1.  Go to [Google Cloud Console](https://console.cloud.google.com/)
-    ![Step 1](images/step-1.png)
+<img src="images/step-1.png" align="center">
+    <!-- ![Step 1](images/step-1.png) -->
 
 2.  Click **"Select a project"**
-    ![Step 2](images/step-2.png)
+
+<img src="images/step-2.png" align="center">
+
+ <!-- ![Step 2](images/step-2.png) -->
 
 3.  Click **"New project"**
     ![Step 3](images/step-3.png)
@@ -65,14 +69,18 @@ Tether includes a **Setup Wizard** in the settings tab to guide you through thes
     ![Step 6](images/step-6.png)
 
 7.  Click **"Library"**
+    ![Step 7](images/step-7.png)
+
+8.  Click the **"Search for APIs & Services"** field.
     ![Step 8](images/step-8.png)
-9.  Click the **"Search for APIs & Services"** field.
+
+9. Type **"Google drive"**
     ![Step 9](images/step-9.png)
-10. Type **"Google drive"**
+
+10. Click **"google drive api"**
     ![Step 10](images/step-10.png)
-11. Click **"google drive api"**
-    ![Step 11](images/step-11.png)
-12. Click **"Google Drive API"**
+
+11. Click **"Google Drive API"**
     ![Step 12](images/step-12.png)
 13. Click **"Enable"**
     ![Step 13](images/step-13.png)
