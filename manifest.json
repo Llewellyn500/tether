@@ -3,7 +3,7 @@
   "name": "Tether",
   "version": "1.0.0",
   "minAppVersion": "0.15.0",
-  "description": "Sync your Obsidian vault with Google Drive using your own Google Cloud credentials.",
+  "description": "Sync your vault with Google Drive using your own Google Cloud credentials.",
   "author": "Llewellyn Paintsil",
   "authorUrl": "https://github.com/Llewellyn500",
   "isDesktopOnly": false
