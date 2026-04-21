@@ -939,6 +939,10 @@ var CreateFolderModal = class extends import_obsidian5.Modal {
 
 // ui/setup-guide.ts
 var import_obsidian6 = require("obsidian");
+var SETUP_GUIDE_IMAGE_BASE_URL = "https://raw.githubusercontent.com/Llewellyn500/obsidian-tether/main/images";
+function getSetupGuideImageUrl(imageName) {
+  return `${SETUP_GUIDE_IMAGE_BASE_URL}/${imageName}.png`;
+}
 var SetupGuideModal = class extends import_obsidian6.Modal {
   constructor(app) {
     super(app);
@@ -947,92 +951,104 @@ var SetupGuideModal = class extends import_obsidian6.Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("gdrive-setup-modal");
-    contentEl.createEl("h2", { text: "\u{1F680} Google Drive Sync: Full Setup Guide" });
-    contentEl.createEl("p", { text: "Follow these 57 steps to configure your Google Cloud project correctly. This ensures full vault sync (including hidden folders) works perfectly." });
+    contentEl.createEl("h2", { text: "\u{1F680} Tether: Full Setup Guide" });
+    const subtitle = contentEl.createEl("p", {
+      text: "Follow these steps to configure your Google Cloud project. This ensures full vault sync (including hidden folders) works perfectly."
+    });
+    subtitle.setAttr("style", "opacity: 0.8; margin-bottom: 16px;");
     const stepsContainer = contentEl.createDiv({ cls: "setup-steps-scroll" });
     stepsContainer.setAttr("style", "max-height: 70vh; overflow-y: auto; padding-right: 10px; margin-bottom: 20px;");
     const steps = [
-      `Navigate to 'https://console.cloud.google.com/"`,
-      'Click "Select a project"',
-      'Click "New project"',
-      'Type "Tether-Sync"',
-      'Click "Create"',
-      'Click "APIs & Services"',
-      'Click "Library"',
-      'Click the "Search for APIs & Services" field.',
-      'Type "Google drive"',
-      'Click "google drive api"',
-      'Click "Google Drive API"',
-      'Click "Enable"',
-      'Click "OAuth consent screen"',
-      'Click "Get started"',
-      'Click the "App name" field.',
-      'Type "Tether-Sync"',
-      "Click User Support email.",
-      "Click your email address from the dropdown.",
-      'Click "Next"',
-      'Click "External"',
-      'Click "Next"',
-      'Click "Email addresses" (under Developer contact info).',
-      'Click "Next"',
-      'Click the "I agree to the Google API Services: User Data Policy." field.',
-      'Click "Continue"',
-      'Click "Create"',
-      'Click "Data Access"',
-      'Click "Add or remove scopes"',
-      "Manually add the following scope string: https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email",
-      "Press ctrl + c to copy the scope string above.",
-      'Click the "Manually add scopes" field.',
-      "Press ctrl + v to paste the scope string.",
-      'Click "Add to table"',
-      'Click "Update"',
-      'Click "Save"',
-      'Click "Audience"',
-      'Click "Add users"',
-      "Add your own Gmail address as a test user.",
-      'Click "Save"',
-      'Click "Clients"',
-      'Click "Create client"',
-      'Click the "Application type" dropdown.',
-      'Click "Web application"',
-      'Click the "Name" field.',
-      "Press ctrl + a to select existing name.",
-      'Type "Tether Sync"',
-      'Under "Authorized redirect URIs", add: https://obsidian.md',
-      "Press ctrl + c to copy the redirect URI.",
-      "Switch back to the Google Cloud tab.",
-      'Click the "Add URI" button.',
-      'Click the "URIs 1" field.',
-      "Press ctrl + v to paste the redirect URI.",
-      'Click "Create"',
-      'Copy the "Client ID" and paste it into Tether settings.',
-      'Copy the "Client Secret" and paste it into Tether settings.',
-      'Click "OK"'
+      { text: "Go to Google Cloud Console", image: "step-1" },
+      { text: 'Click "Select a project"', image: "step-2" },
+      { text: 'Click "New project"', image: "step-3" },
+      { text: 'In the project name field, type "Tether-Sync"', image: "step-4" },
+      { text: 'Click "Create"', image: "step-5" },
+      { text: 'Click "APIs & Services"', image: "step-6" },
+      { text: 'Click "Library"', image: "step-7" },
+      { text: 'Click the "Search for APIs & Services" field.', image: "step-8" },
+      { text: 'Type "Google drive"' },
+      { text: 'Click "google drive api"', image: "step-10" },
+      { text: 'Click "Google Drive API"', image: "step-11" },
+      { text: 'Click "Enable"', image: "step-12" },
+      { text: 'Click "OAuth consent screen"', image: "step-13" },
+      { text: 'Click "Get started"', image: "step-14" },
+      { text: 'Click the "App name" field.', image: "step-15" },
+      { text: 'Type "Tether-Sync"' },
+      { text: "Click User Support email.", image: "step-17" },
+      { text: "Click your email address from the dropdown." },
+      { text: 'Click "External"', image: "step-19" },
+      { text: `Pick the developer's "Email address" (Developer contact info)`, image: "step-20" },
+      { text: 'Click the "I agree to the Google API Services: User Data Policy." field.' },
+      { text: 'Click "Create"', image: "step-22" },
+      { text: 'Click "Data Access"', image: "step-23" },
+      { text: 'Click "Add or remove scopes"', image: "step-24" },
+      {
+        text: "Copy the scope string below:",
+        codeBlock: "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email"
+      },
+      { text: 'Paste the string in the "Manually add scopes" field.', image: "step-26" },
+      { text: 'Click "Add to table"', image: "step-27" },
+      { text: 'Click "Update"', image: "step-28" },
+      { text: 'Click "Save"', image: "step-29" },
+      { text: 'Click "Audience"', image: "step-30" },
+      { text: 'Click "Add users"', image: "step-31" },
+      { text: "Add your email as a user." },
+      { text: 'Click "Clients"', image: "step-33" },
+      { text: 'Click "Create client"', image: "step-34" },
+      { text: 'Choose "Web application" as the application type.', image: "step-35" },
+      { text: 'Type "Tether Sync" in the "Name" field.', image: "step-36" },
+      {
+        text: "Copy the redirect URI below:",
+        codeBlock: "https://obsidian.md"
+      },
+      { text: 'Click the "Add URI" icon.', image: "step-38" },
+      { text: 'Paste the redirect URI in the "URIs 1" field.', image: "step-39" },
+      { text: 'Click "Create"' },
+      { text: "Copy the Client ID and paste it in Tether's settings." },
+      { text: "Copy the Client Secret and paste it in Tether's settings.", image: "step-42" }
     ];
-    steps.forEach((stepText, index) => {
+    steps.forEach((step, index) => {
       const stepDiv = stepsContainer.createDiv({ cls: "setup-step" });
-      stepDiv.setAttr("style", "margin-bottom: 30px; border-bottom: 1px solid #333; padding-bottom: 20px;");
-      stepDiv.createEl("h3", { text: `Step ${index + 1}` });
-      stepDiv.createEl("p", { text: stepText });
-      const img = stepDiv.createEl("img");
-      img.setAttr("src", `images/step-${index + 1}.png`);
-      img.setAttr("alt", `Screenshot for Step ${index + 1}`);
-      img.setAttr("style", "max-width: 100%; border: 1px solid #444; border-radius: 4px; display: block; margin-top: 10px; min-height: 50px; background: #222;");
-      if (index === 29) {
-        const code = stepDiv.createEl("code", {
-          text: "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email"
-        });
-        code.setAttr("style", "display: block; background: #111; padding: 10px; margin-top: 10px; color: #4caf50; word-break: break-all;");
+      stepDiv.setAttr("style", "margin-bottom: 24px; border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 20px;");
+      const headerEl = stepDiv.createEl("div");
+      headerEl.setAttr("style", "display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px;");
+      const badge = headerEl.createEl("span", { text: `${index + 1}` });
+      badge.setAttr("style", "display: inline-flex; align-items: center; justify-content: center; min-width: 28px; height: 28px; border-radius: 50%; background: var(--interactive-accent); color: var(--text-on-accent); font-weight: 700; font-size: 13px; flex-shrink: 0;");
+      const textEl = headerEl.createEl("span", { text: step.text });
+      textEl.setAttr("style", "font-size: 15px; line-height: 1.5;");
+      if (step.codeBlock) {
+        const codeWrapper = stepDiv.createEl("div");
+        codeWrapper.setAttr("style", "position: relative; margin-top: 8px; border-radius: 6px; overflow: hidden;");
+        const code = codeWrapper.createEl("code", { text: step.codeBlock });
+        code.setAttr("style", "display: block; background: var(--code-background); padding: 12px 14px; color: var(--code-normal); font-size: 13px; word-break: break-all; border-radius: 6px; border: 1px solid var(--background-modifier-border); font-family: var(--font-monospace); user-select: all; cursor: text;");
+      }
+      if (step.image) {
+        const img = stepDiv.createEl("img");
+        img.setAttr("src", getSetupGuideImageUrl(step.image));
+        img.setAttr("alt", `Screenshot for Step ${index + 1}`);
+        img.setAttr("loading", "lazy");
+        img.setAttr("style", "max-width: 100%; border: 1px solid var(--background-modifier-border); border-radius: 6px; display: block; margin-top: 10px; min-height: 40px; background: var(--background-secondary);");
       }
     });
     const finalStep = stepsContainer.createDiv({ cls: "setup-step" });
-    finalStep.createEl("h3", { text: "Final Step: Login" });
+    finalStep.setAttr("style", "margin-bottom: 24px; padding-bottom: 20px;");
+    const finalHeader = finalStep.createEl("h3", { text: "\u{1F510} Final Step: Authentication" });
+    finalHeader.setAttr("style", "margin-top: 8px; margin-bottom: 12px;");
+    const loginSteps = [
+      'In Obsidian settings for Tether, click "Open Login Page".',
+      "Log in with your Google account.",
+      "You will be redirected to obsidian.md. Copy the entire URL from your browser bar.",
+      'Paste that URL into the "Authorization Code" box in Obsidian and click Verify Code.'
+    ];
     const list = finalStep.createEl("ol");
-    list.createEl("li", { text: 'Go back to Tether settings and click "Open Login Page".' });
-    list.createEl("li", { text: "Log in and you will be redirected to obsidian.md." });
-    list.createEl("li", { text: 'Copy the entire URL from the browser bar and paste it into the "Authorization Code" box in Obsidian.' });
-    const readyText = contentEl.createEl("p", { text: "\u{1F389} You are ready to go!" });
-    readyText.setAttr("style", "font-weight: bold; text-align: center;");
+    list.setAttr("style", "padding-left: 22px; line-height: 1.8;");
+    loginSteps.forEach((text) => {
+      list.createEl("li", { text });
+    });
+    const readyBanner = contentEl.createEl("div");
+    readyBanner.setAttr("style", "text-align: center; padding: 12px; margin-bottom: 8px; border-radius: 8px; background: var(--background-secondary);");
+    readyBanner.createEl("span", { text: "\u{1F389} You are ready to go!" }).setAttr("style", "font-weight: 700; font-size: 16px;");
     const btnContainer = contentEl.createDiv({ cls: "modal-button-container" });
     btnContainer.createEl("button", { text: "Got it, let's go!", cls: "mod-cta" }).onClickEvent(() => this.close());
   }

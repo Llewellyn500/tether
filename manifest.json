@@ -3,7 +3,7 @@
   "name": "Tether",
   "version": "1.0.0",
   "minAppVersion": "0.15.0",
-  "description": "A simple self powered Google Drive sync engine for obsidian vaults.",
+  "description": "Sync your Obsidian vault with Google Drive using your own Google Cloud credentials.",
   "author": "Llewellyn Paintsil",
   "authorUrl": "https://github.com/Llewellyn500",
   "isDesktopOnly": false
