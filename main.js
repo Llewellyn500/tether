@@ -305,7 +305,8 @@ var SyncStatusView = class extends import_obsidian3.ItemView {
       status: "Idle",
       lastSync: "Never",
       errors: [],
-      conflicts: []
+      conflicts: [],
+      deferred: []
     };
   }
   getViewType() {
@@ -337,6 +338,7 @@ var SyncStatusView = class extends import_obsidian3.ItemView {
     this.createStat(statsGrid, "Status", this.stats.status);
     this.createStat(statsGrid, "Progress", `${this.stats.processed} / ${this.stats.totalFiles}`);
     this.createStat(statsGrid, "Conflicts", this.stats.conflicts.length.toString(), this.stats.conflicts.length > 0 ? "text-warning" : "");
+    this.createStat(statsGrid, "Deferred", this.stats.deferred.length.toString(), this.stats.deferred.length > 0 ? "text-accent" : "");
     this.createStat(statsGrid, "Failed", this.stats.failed.toString(), this.stats.failed > 0 ? "text-error" : "");
     if (this.stats.currentFile) {
       container.createEl("p", { text: `Currently: ${this.stats.currentFile}`, cls: "current-file-text" });
@@ -357,13 +359,13 @@ var SyncStatusView = class extends import_obsidian3.ItemView {
             if (file instanceof import_obsidian3.TFile) {
               await this.app.workspace.getLeaf(true).openFile(file);
             } else if (conflict.path.startsWith(".obsidian/")) {
-              new Notice("Cannot open hidden config files directly in the editor. Please use an external editor or a File Explorer plugin to view this file.");
+              new import_obsidian3.Notice("Cannot open hidden config files directly in the editor. Please use an external editor or a File Explorer plugin to view this file.");
             } else {
               await this.app.workspace.openLinkText(conflict.path, "", true);
             }
           } catch (e) {
             console.error("Failed to open conflict file", e);
-            new Notice("Failed to open file: " + e.message);
+            new import_obsidian3.Notice("Failed to open file: " + e.message);
           }
         });
         const delBtn = btnContainer.createEl("button", { text: "Delete", cls: "mod-warning conflict-del-btn" });
@@ -374,12 +376,21 @@ ${conflict.path}`)) {
               await this.app.vault.adapter.remove(conflict.path);
               this.stats.conflicts = this.stats.conflicts.filter((c) => c.path !== conflict.path);
               this.render();
-              new Notice("Conflict file deleted.");
+              new import_obsidian3.Notice("Conflict file deleted.");
             } catch (e) {
-              new Notice("Failed to delete file: " + e.message);
+              new import_obsidian3.Notice("Failed to delete file: " + e.message);
             }
           }
         });
+      });
+    }
+    if (this.stats.deferred.length > 0) {
+      container.createEl("h4", { text: "Deferred (Active Edits)" });
+      const deferredList = container.createDiv({ cls: "sync-deferred-list" });
+      this.stats.deferred.slice(-10).reverse().forEach((deferred) => {
+        const item = deferredList.createDiv({ cls: "deferred-item" });
+        item.createEl("b", { text: deferred.path.split("/").pop() || deferred.path });
+        item.createEl("p", { text: `${deferred.reason}: ${deferred.path}` });
       });
     }
     if (this.stats.errors.length > 0) {
@@ -400,6 +411,8 @@ ${conflict.path}`)) {
 };
 
 // sync/engine.ts
+var RECENT_LOCAL_EDIT_GRACE_MS = 5e3;
+var DRAWING_LOCAL_EDIT_GRACE_MS = 3e4;
 var SyncEngine = class {
   constructor(app, client, stateManager, folderId, statusBarItem) {
     this.folderCache = /* @__PURE__ */ new Map();
@@ -411,7 +424,8 @@ var SyncEngine = class {
       status: "Idle",
       lastSync: "",
       errors: [],
-      conflicts: []
+      conflicts: [],
+      deferred: []
     };
     this.app = app;
     this.client = client;
@@ -443,6 +457,7 @@ var SyncEngine = class {
       this.stats.processed = 0;
       this.stats.failed = 0;
       this.stats.errors = [];
+      this.stats.deferred = [];
       this.folderCache.clear();
       this.updateStatus("Loading state...");
       await this.stateManager.load();
@@ -524,6 +539,8 @@ var SyncEngine = class {
       await this.stateManager.save();
       if (this.stats.failed > 0) {
         new import_obsidian4.Notice(`Sync complete with ${this.stats.failed} errors. Check sidebar.`);
+      } else if (this.stats.deferred.length > 0) {
+        new import_obsidian4.Notice(`Sync complete. Deferred ${this.stats.deferred.length} active file${this.stats.deferred.length === 1 ? "" : "s"} until editing stops.`);
       } else {
         new import_obsidian4.Notice("Sync complete successfully!");
       }
@@ -561,6 +578,9 @@ var SyncEngine = class {
       await this.ensureRemotePathByPath(path, vaultRootId);
       return;
     }
+    if (await this.shouldDeferActiveLocalFile(path, stat)) {
+      return;
+    }
     const state = this.stateManager.get(path);
     const extension = path.includes(".") ? path.split(".").pop() || "" : "";
     const mimeType = this.getMimeType(extension);
@@ -568,23 +588,29 @@ var SyncEngine = class {
     if (!state) {
       const parentPath = path.includes("/") ? path.split("/").slice(0, -1).join("/") : "";
       const driveParentId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
-      const content = await this.app.vault.adapter.readBinary(path);
-      const remoteFile = await this.client.uploadFile(fileName, driveParentId, content, mimeType);
+      const upload = await this.readStableLocalFile(path, stat);
+      if (!upload)
+        return;
+      const remoteFile = await this.client.uploadFile(fileName, driveParentId, upload.content, mimeType);
       this.stateManager.set(path, {
         driveId: remoteFile.id,
-        lastSyncedMtime: stat.mtime,
+        lastSyncedMtime: upload.stat.mtime,
         remoteMtime: remoteFile.modifiedTime,
         etag: ""
       });
+      await this.deferIfChangedAfterUpload(path, upload.stat);
       await this.stateManager.save();
     } else if (stat.mtime > state.lastSyncedMtime) {
-      const content = await this.app.vault.adapter.readBinary(path);
-      const remoteFile = await this.client.updateFile(state.driveId, content, mimeType);
+      const upload = await this.readStableLocalFile(path, stat);
+      if (!upload)
+        return;
+      const remoteFile = await this.client.updateFile(state.driveId, upload.content, mimeType);
       this.stateManager.set(path, {
         ...state,
-        lastSyncedMtime: stat.mtime,
+        lastSyncedMtime: upload.stat.mtime,
         remoteMtime: remoteFile.modifiedTime
       });
+      await this.deferIfChangedAfterUpload(path, upload.stat);
       await this.stateManager.save();
     }
   }
@@ -685,17 +711,20 @@ var SyncEngine = class {
     }
     const state = this.stateManager.get(path);
     const existsLocal = await this.app.vault.adapter.exists(path);
+    const localStat = existsLocal ? await this.app.vault.adapter.stat(path) : null;
+    if ((localStat == null ? void 0 : localStat.type) === "file" && await this.shouldDeferActiveLocalFile(path, localStat)) {
+      return;
+    }
     if (!state) {
       if (existsLocal) {
-        const stat = await this.app.vault.adapter.stat(path);
-        if (path.startsWith(".obsidian/") && stat) {
+        if (path.startsWith(".obsidian/") && localStat) {
           const remoteTime = new Date(remoteFile.modifiedTime).getTime();
-          if (remoteTime > stat.mtime) {
+          if (remoteTime > localStat.mtime) {
             await this.download(path, remoteFile);
           } else {
             this.stateManager.set(path, {
               driveId: remoteFile.id,
-              lastSyncedMtime: stat.mtime,
+              lastSyncedMtime: localStat.mtime,
               remoteMtime: remoteFile.modifiedTime,
               etag: ""
             });
@@ -708,11 +737,10 @@ var SyncEngine = class {
         await this.download(path, remoteFile);
       }
     } else if (remoteFile.modifiedTime !== state.remoteMtime) {
-      const stat = await this.app.vault.adapter.stat(path);
-      if (stat && stat.mtime > state.lastSyncedMtime) {
+      if (localStat && localStat.mtime > state.lastSyncedMtime) {
         if (path.startsWith(".obsidian/")) {
           const remoteTime = new Date(remoteFile.modifiedTime).getTime();
-          if (remoteTime > stat.mtime) {
+          if (remoteTime > localStat.mtime) {
             await this.download(path, remoteFile);
           } else {
             this.stateManager.set(path, {
@@ -738,7 +766,19 @@ var SyncEngine = class {
           if (await this.app.vault.adapter.exists(path)) {
             this.updateStatus(`Deleting local: ${path}`);
             const stat = await this.app.vault.adapter.stat(path);
+            if ((stat == null ? void 0 : stat.type) === "file" && stat.mtime > entry.lastSyncedMtime) {
+              if (await this.shouldDeferActiveLocalFile(path, stat)) {
+                this.stateManager.remove(path);
+                continue;
+              }
+              this.stateManager.remove(path);
+              continue;
+            }
             if ((stat == null ? void 0 : stat.type) === "folder") {
+              if (await this.hasUnsyncedLocalDescendant(path)) {
+                this.stateManager.remove(path);
+                continue;
+              }
               await this.app.vault.adapter.rmdir(path, false).catch(async (err) => {
                 if (!path.startsWith(".obsidian/")) {
                   await this.app.vault.adapter.rmdir(path, true);
@@ -817,6 +857,65 @@ var SyncEngine = class {
       etag: ""
     });
     await this.stateManager.save();
+  }
+  async hasUnsyncedLocalDescendant(folderPath) {
+    const descendants = await this.listAllLocalItems(folderPath);
+    for (const path of descendants) {
+      const stat = await this.app.vault.adapter.stat(path);
+      if (!stat || stat.type !== "file")
+        continue;
+      const state = this.stateManager.get(path);
+      if (!state || stat.mtime > state.lastSyncedMtime) {
+        await this.shouldDeferActiveLocalFile(path, stat);
+        return true;
+      }
+    }
+    return false;
+  }
+  async shouldDeferActiveLocalFile(path, stat) {
+    const localStat = stat != null ? stat : await this.app.vault.adapter.stat(path);
+    if (!localStat || localStat.type !== "file")
+      return false;
+    const graceMs = this.getLocalEditGraceMs(path);
+    const ageMs = Date.now() - localStat.mtime;
+    if (ageMs < graceMs) {
+      this.addDeferredFile(path, "recent local edit");
+      return true;
+    }
+    return false;
+  }
+  async readStableLocalFile(path, stat) {
+    const content = await this.app.vault.adapter.readBinary(path);
+    const latestStat = await this.app.vault.adapter.stat(path);
+    if (!latestStat || latestStat.type !== "file") {
+      this.addDeferredFile(path, "changed while syncing");
+      return null;
+    }
+    if (latestStat.mtime !== stat.mtime || latestStat.size !== stat.size) {
+      this.addDeferredFile(path, "changed while syncing");
+      return null;
+    }
+    return { content, stat: latestStat };
+  }
+  async deferIfChangedAfterUpload(path, syncedStat) {
+    const latestStat = await this.app.vault.adapter.stat(path);
+    if (!latestStat || latestStat.type !== "file")
+      return;
+    if (latestStat.mtime !== syncedStat.mtime || latestStat.size !== syncedStat.size) {
+      this.addDeferredFile(path, "changed while syncing");
+    }
+  }
+  addDeferredFile(path, reason) {
+    if (this.stats.deferred.some((item) => item.path === path))
+      return;
+    this.stats.deferred.push({ path, reason });
+  }
+  getLocalEditGraceMs(path) {
+    return this.isDrawingPath(path) ? DRAWING_LOCAL_EDIT_GRACE_MS : RECENT_LOCAL_EDIT_GRACE_MS;
+  }
+  isDrawingPath(path) {
+    const normalized = path.toLowerCase();
+    return normalized.endsWith(".drawing") || normalized.startsWith("assets/ink/") || normalized.includes("/ink/");
   }
   getMimeType(extension) {
     const mimes = {

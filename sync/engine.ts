@@ -1,7 +1,11 @@
-import { App, TFile, TFolder, Notice, TAbstractFile } from 'obsidian';
+import { App, Notice } from 'obsidian';
+import type { Stat } from 'obsidian';
 import { GoogleDriveClient, DriveFile } from './gdrive';
-import { StateManager, SyncEntry } from './state';
+import { StateManager } from './state';
 import { SyncStatusView, SyncStats, VIEW_TYPE_SYNC_STATUS } from '../ui/sync-view';
+
+const RECENT_LOCAL_EDIT_GRACE_MS = 5000;
+const DRAWING_LOCAL_EDIT_GRACE_MS = 30000;
 
 export class SyncEngine {
 	app: App;
@@ -19,7 +23,8 @@ export class SyncEngine {
 		status: 'Idle',
 		lastSync: '',
 		errors: [],
-		conflicts: []
+		conflicts: [],
+		deferred: []
 	};
 
 	constructor(app: App, client: GoogleDriveClient, stateManager: StateManager, folderId: string, statusBarItem: HTMLElement) {
@@ -56,6 +61,7 @@ export class SyncEngine {
 			this.stats.processed = 0;
 			this.stats.failed = 0;
 			this.stats.errors = [];
+			this.stats.deferred = [];
 			this.folderCache.clear();
 			
 			this.updateStatus('Loading state...');
@@ -156,6 +162,8 @@ export class SyncEngine {
 			
 			if (this.stats.failed > 0) {
 				new Notice(`Sync complete with ${this.stats.failed} errors. Check sidebar.`);
+			} else if (this.stats.deferred.length > 0) {
+				new Notice(`Sync complete. Deferred ${this.stats.deferred.length} active file${this.stats.deferred.length === 1 ? '' : 's'} until editing stops.`);
 			} else {
 				new Notice('Sync complete successfully!');
 			}
@@ -204,6 +212,10 @@ export class SyncEngine {
 			return;
 		}
 
+		if (await this.shouldDeferActiveLocalFile(path, stat)) {
+			return;
+		}
+
 		const state = this.stateManager.get(path);
 		const extension = path.includes('.') ? path.split('.').pop() || '' : '';
 		const mimeType = this.getMimeType(extension);
@@ -213,25 +225,29 @@ export class SyncEngine {
 			const parentPath = path.includes('/') ? path.split('/').slice(0, -1).join('/') : '';
 			const driveParentId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
 			
-			const content = await this.app.vault.adapter.readBinary(path);
-			const remoteFile = await this.client.uploadFile(fileName, driveParentId, content, mimeType);
+			const upload = await this.readStableLocalFile(path, stat);
+			if (!upload) return;
+			const remoteFile = await this.client.uploadFile(fileName, driveParentId, upload.content, mimeType);
 			
 			this.stateManager.set(path, {
 				driveId: remoteFile.id,
-				lastSyncedMtime: stat.mtime,
+				lastSyncedMtime: upload.stat.mtime,
 				remoteMtime: remoteFile.modifiedTime,
 				etag: ''
 			});
+			await this.deferIfChangedAfterUpload(path, upload.stat);
 			await this.stateManager.save();
 		} else if (stat.mtime > state.lastSyncedMtime) {
-			const content = await this.app.vault.adapter.readBinary(path);
-			const remoteFile = await this.client.updateFile(state.driveId, content, mimeType);
+			const upload = await this.readStableLocalFile(path, stat);
+			if (!upload) return;
+			const remoteFile = await this.client.updateFile(state.driveId, upload.content, mimeType);
 			
 			this.stateManager.set(path, {
 				...state,
-				lastSyncedMtime: stat.mtime,
+				lastSyncedMtime: upload.stat.mtime,
 				remoteMtime: remoteFile.modifiedTime
 			});
+			await this.deferIfChangedAfterUpload(path, upload.stat);
 			await this.stateManager.save();
 		}
 	}
@@ -346,20 +362,24 @@ export class SyncEngine {
 
 		const state = this.stateManager.get(path);
 		const existsLocal = await this.app.vault.adapter.exists(path);
+		const localStat = existsLocal ? await this.app.vault.adapter.stat(path) : null;
+
+		if (localStat?.type === 'file' && await this.shouldDeferActiveLocalFile(path, localStat)) {
+			return;
+		}
 
 		if (!state) {
 			if (existsLocal) {
-				const stat = await this.app.vault.adapter.stat(path);
-				if (path.startsWith('.obsidian/') && stat) {
+				if (path.startsWith('.obsidian/') && localStat) {
 					const remoteTime = new Date(remoteFile.modifiedTime).getTime();
-					if (remoteTime > stat.mtime) {
+					if (remoteTime > localStat.mtime) {
 						await this.download(path, remoteFile);
 					} else {
 						// Local is newer. Update state so we don't treat it as a conflict next time.
 						// processLocalPath will handle the upload to remote.
 						this.stateManager.set(path, {
 							driveId: remoteFile.id,
-							lastSyncedMtime: stat.mtime,
+							lastSyncedMtime: localStat.mtime,
 							remoteMtime: remoteFile.modifiedTime,
 							etag: ''
 						});
@@ -372,11 +392,10 @@ export class SyncEngine {
 				await this.download(path, remoteFile);
 			}
 		} else if (remoteFile.modifiedTime !== state.remoteMtime) {
-			const stat = await this.app.vault.adapter.stat(path);
-			if (stat && stat.mtime > state.lastSyncedMtime) {
+			if (localStat && localStat.mtime > state.lastSyncedMtime) {
 				if (path.startsWith('.obsidian/')) {
 					const remoteTime = new Date(remoteFile.modifiedTime).getTime();
-					if (remoteTime > stat.mtime) {
+					if (remoteTime > localStat.mtime) {
 						await this.download(path, remoteFile);
 					} else {
 						// Local is newer. We've already verified mtime > lastSyncedMtime.
@@ -409,7 +428,21 @@ export class SyncEngine {
 					if (await this.app.vault.adapter.exists(path)) {
 						this.updateStatus(`Deleting local: ${path}`);
 						const stat = await this.app.vault.adapter.stat(path);
+						if (stat?.type === 'file' && stat.mtime > entry.lastSyncedMtime) {
+							if (await this.shouldDeferActiveLocalFile(path, stat)) {
+								this.stateManager.remove(path);
+								continue;
+							}
+
+							this.stateManager.remove(path);
+							continue;
+						}
 						if (stat?.type === 'folder') {
+							if (await this.hasUnsyncedLocalDescendant(path)) {
+								this.stateManager.remove(path);
+								continue;
+							}
+
 							// Use rmdir for folders. Recursive: false because we handle children individually
 							// due to the sorted loop.
 							await (this.app.vault.adapter as any).rmdir(path, false).catch(async (err: any) => {
@@ -505,6 +538,79 @@ export class SyncEngine {
 			etag: ''
 		});
 		await this.stateManager.save();
+	}
+
+	private async hasUnsyncedLocalDescendant(folderPath: string): Promise<boolean> {
+		const descendants = await this.listAllLocalItems(folderPath);
+
+		for (const path of descendants) {
+			const stat = await this.app.vault.adapter.stat(path);
+			if (!stat || stat.type !== 'file') continue;
+
+			const state = this.stateManager.get(path);
+			if (!state || stat.mtime > state.lastSyncedMtime) {
+				await this.shouldDeferActiveLocalFile(path, stat);
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private async shouldDeferActiveLocalFile(path: string, stat?: Stat | null): Promise<boolean> {
+		const localStat = stat ?? await this.app.vault.adapter.stat(path);
+		if (!localStat || localStat.type !== 'file') return false;
+
+		const graceMs = this.getLocalEditGraceMs(path);
+		const ageMs = Date.now() - localStat.mtime;
+		if (ageMs < graceMs) {
+			this.addDeferredFile(path, 'recent local edit');
+			return true;
+		}
+
+		return false;
+	}
+
+	private async readStableLocalFile(path: string, stat: Stat): Promise<{ content: ArrayBuffer, stat: Stat } | null> {
+		const content = await this.app.vault.adapter.readBinary(path);
+		const latestStat = await this.app.vault.adapter.stat(path);
+
+		if (!latestStat || latestStat.type !== 'file') {
+			this.addDeferredFile(path, 'changed while syncing');
+			return null;
+		}
+
+		if (latestStat.mtime !== stat.mtime || latestStat.size !== stat.size) {
+			this.addDeferredFile(path, 'changed while syncing');
+			return null;
+		}
+
+		return { content, stat: latestStat };
+	}
+
+	private async deferIfChangedAfterUpload(path: string, syncedStat: Stat) {
+		const latestStat = await this.app.vault.adapter.stat(path);
+		if (!latestStat || latestStat.type !== 'file') return;
+
+		if (latestStat.mtime !== syncedStat.mtime || latestStat.size !== syncedStat.size) {
+			this.addDeferredFile(path, 'changed while syncing');
+		}
+	}
+
+	private addDeferredFile(path: string, reason: string) {
+		if (this.stats.deferred.some(item => item.path === path)) return;
+		this.stats.deferred.push({ path, reason });
+	}
+
+	private getLocalEditGraceMs(path: string): number {
+		return this.isDrawingPath(path) ? DRAWING_LOCAL_EDIT_GRACE_MS : RECENT_LOCAL_EDIT_GRACE_MS;
+	}
+
+	private isDrawingPath(path: string): boolean {
+		const normalized = path.toLowerCase();
+		return normalized.endsWith('.drawing') ||
+			   normalized.startsWith('assets/ink/') ||
+			   normalized.includes('/ink/');
 	}
 
 	private getMimeType(extension: string): string {

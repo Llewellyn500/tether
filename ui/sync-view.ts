@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, setIcon, TFile } from 'obsidian';
+import { ItemView, Notice, WorkspaceLeaf, TFile } from 'obsidian';
 
 export const VIEW_TYPE_SYNC_STATUS = 'gdrive-sync-status-view';
 
@@ -11,6 +11,7 @@ export interface SyncStats {
 	lastSync: string;
 	errors: { path: string, message: string }[];
 	conflicts: { path: string, originalPath: string, timestamp: string }[];
+	deferred: { path: string, reason: string }[];
 }
 
 export class SyncStatusView extends ItemView {
@@ -22,7 +23,8 @@ export class SyncStatusView extends ItemView {
 		status: 'Idle',
 		lastSync: 'Never',
 		errors: [],
-		conflicts: []
+		conflicts: [],
+		deferred: []
 	};
 
 	constructor(leaf: WorkspaceLeaf) {
@@ -66,6 +68,7 @@ export class SyncStatusView extends ItemView {
 		this.createStat(statsGrid, 'Status', this.stats.status);
 		this.createStat(statsGrid, 'Progress', `${this.stats.processed} / ${this.stats.totalFiles}`);
 		this.createStat(statsGrid, 'Conflicts', this.stats.conflicts.length.toString(), this.stats.conflicts.length > 0 ? 'text-warning' : '');
+		this.createStat(statsGrid, 'Deferred', this.stats.deferred.length.toString(), this.stats.deferred.length > 0 ? 'text-accent' : '');
 		this.createStat(statsGrid, 'Failed', this.stats.failed.toString(), this.stats.failed > 0 ? 'text-error' : '');
 
 		if (this.stats.currentFile) {
@@ -114,6 +117,16 @@ export class SyncStatusView extends ItemView {
 						}
 					}
 				});
+			});
+		}
+
+		if (this.stats.deferred.length > 0) {
+			container.createEl('h4', { text: 'Deferred (Active Edits)' });
+			const deferredList = container.createDiv({ cls: 'sync-deferred-list' });
+			this.stats.deferred.slice(-10).reverse().forEach(deferred => {
+				const item = deferredList.createDiv({ cls: 'deferred-item' });
+				item.createEl('b', { text: deferred.path.split('/').pop() || deferred.path });
+				item.createEl('p', { text: `${deferred.reason}: ${deferred.path}` });
 			});
 		}
 

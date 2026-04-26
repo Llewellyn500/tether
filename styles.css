@@ -44,6 +44,24 @@
 	margin-top: 10px;
 }
 
+.sync-deferred-list {
+	margin-top: 10px;
+}
+
+.deferred-item {
+	background-color: var(--background-secondary-alt);
+	border-left: 3px solid var(--text-accent);
+	padding: 8px;
+	margin-bottom: 8px;
+	border-radius: 4px;
+	font-size: 0.85em;
+}
+
+.deferred-item p {
+	margin: 4px 0 0 0;
+	color: var(--text-muted);
+}
+
 .error-item {
 	background-color: var(--background-secondary-alt);
 	border-left: 3px solid var(--text-error);
