@@ -12,7 +12,11 @@ const MANUAL_STATUS_UPDATE_MS = 500;
 const BACKGROUND_STATUS_UPDATE_MS = 3000;
 const WORK_YIELD_ITEM_LIMIT = 25;
 
+export type SyncMode = 'pull' | 'push';
+const GOOGLE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
+
 interface SyncOptions {
+	mode?: SyncMode;
 	silent?: boolean;
 	statusUpdateIntervalMs?: number;
 }
@@ -24,6 +28,7 @@ export class SyncEngine {
 	folderId: string;
 	statusBarItem: HTMLElement;
 	private folderCache: Map<string, string> = new Map();
+	private remoteFolderCache: Map<string, DriveFile[]> = new Map();
 	private silent = false;
 	private statusUpdateIntervalMs = MANUAL_STATUS_UPDATE_MS;
 	private lastStatusUpdateAt = 0;
@@ -89,8 +94,12 @@ export class SyncEngine {
 			this.stats.processed = 0;
 			this.stats.failed = 0;
 			this.stats.errors = [];
+			this.stats.conflicts = [];
 			this.stats.deferred = [];
 			this.folderCache.clear();
+			this.remoteFolderCache.clear();
+			const mode = options.mode ?? 'push';
+			const modeLabel = mode === 'pull' ? 'Pull' : 'Push';
 			
 			this.updateStatus('Loading state...', undefined, true);
 			await this.stateManager.load();
@@ -101,42 +110,10 @@ export class SyncEngine {
 			const vaultRootDriveId = await this.ensureVaultRoot(vaultName);
 			this.folderCache.set('', vaultRootDriveId);
 
-			this.updateStatus('Scanning local items...');
-			const localPathSet = await this.collectLocalPathSet('');
-			this.stats.totalFiles = localPathSet.size;
-
-			const locallyDeletedPaths = await this.handleLocalDeletions(localPathSet);
-
-			this.updateStatus('Pulling changes...');
-			const remotePathSet = new Set<string>();
-			await this.processRemoteTree(vaultRootDriveId, remotePathSet, '', 0, locallyDeletedPaths);
-
-			await this.handleRemoteDeletions(remotePathSet);
-
-			this.updateStatus('Pushing changes...');
-			for (const path of localPathSet) {
-				this.stats.processed++;
-				this.stats.currentFile = path;
-				if (this.stats.processed % 10 === 0 || this.stats.processed === this.stats.totalFiles) {
-					this.updateStatus(`Syncing ${this.stats.processed}/${this.stats.totalFiles}${this.stats.failed ? ` (${this.stats.failed} failed)` : ''}`);
-				}
-				
-				try {
-					await this.processLocalPath(path, vaultRootDriveId);
-				} catch (e) {
-					console.error(`Failed to push ${path}`, e);
-					// If the file/folder we are trying to update was deleted on remote, 
-					// clear the state so the next sync treats it as a new upload.
-					if (this.isNotFound(e)) {
-						this.stateManager.remove(path);
-						// Not a "failure" per se, just an out-of-sync state we recovered from
-					} else {
-						this.stats.failed++;
-						this.stats.errors.push({ path, message: this.getErrorMessage(e) });
-					}
-				}
-				this.updateStatus(this.stats.status);
-				await this.afterWorkItem();
+			if (mode === 'pull') {
+				await this.pullFromRemote(vaultRootDriveId);
+			} else {
+				await this.pushToRemote(vaultRootDriveId);
 			}
 
 			this.stats.lastSync = new Date().toLocaleTimeString();
@@ -145,11 +122,11 @@ export class SyncEngine {
 			this.updateStatus('Idle', undefined, true);
 			
 			if (!this.silent && this.stats.failed > 0) {
-				new Notice(`Sync complete with ${this.stats.failed} errors. Check sidebar.`);
+				new Notice(`${modeLabel} complete with ${this.stats.failed} errors. Check sidebar.`);
 			} else if (!this.silent && this.stats.deferred.length > 0) {
-				new Notice(`Sync complete. Deferred ${this.stats.deferred.length} active file${this.stats.deferred.length === 1 ? '' : 's'} until editing stops.`);
+				new Notice(`${modeLabel} complete. Deferred ${this.stats.deferred.length} active file${this.stats.deferred.length === 1 ? '' : 's'} until editing stops.`);
 			} else if (!this.silent) {
-				new Notice('Sync complete successfully!');
+				new Notice(`${modeLabel} complete successfully!`);
 			}
 		} catch (error) {
 			this.updateStatus('Failed', undefined, true);
@@ -158,6 +135,47 @@ export class SyncEngine {
 		} finally {
 			this.silent = previousSilent;
 			this.statusUpdateIntervalMs = previousStatusUpdateIntervalMs;
+		}
+	}
+
+	private async pullFromRemote(vaultRootDriveId: string) {
+		this.stats.processed = 0;
+		this.stats.totalFiles = 0;
+		this.updateStatus('Pulling changes...');
+
+		const remotePathSet = new Set<string>();
+		await this.processRemoteTree(vaultRootDriveId, remotePathSet);
+		await this.handleRemoteDeletions(remotePathSet);
+	}
+
+	private async pushToRemote(vaultRootDriveId: string) {
+		this.updateStatus('Scanning local items...');
+		const localPathSet = await this.collectLocalPathSet('');
+		this.stats.totalFiles = localPathSet.size;
+
+		await this.handleLocalDeletions(localPathSet);
+
+		this.updateStatus('Pushing changes...');
+		for (const path of localPathSet) {
+			this.stats.processed++;
+			this.stats.currentFile = path;
+			if (this.stats.processed % 10 === 0 || this.stats.processed === this.stats.totalFiles) {
+				this.updateStatus(`Pushing ${this.stats.processed}/${this.stats.totalFiles}${this.stats.failed ? ` (${this.stats.failed} failed)` : ''}`);
+			}
+			
+			try {
+				await this.processLocalPath(path, vaultRootDriveId);
+			} catch (e) {
+				console.error(`Failed to push ${path}`, e);
+				if (this.isNotFound(e)) {
+					this.stateManager.remove(path);
+				} else {
+					this.stats.failed++;
+					this.stats.errors.push({ path, message: this.getErrorMessage(e) });
+				}
+			}
+			this.updateStatus(this.stats.status);
+			await this.afterWorkItem();
 		}
 	}
 
@@ -267,18 +285,27 @@ export class SyncEngine {
 			return;
 		}
 
-		const state = this.stateManager.get(path);
+		let state = this.stateManager.get(path);
 		const extension = path.includes('.') ? path.split('.').pop() || '' : '';
 		const mimeType = this.getMimeType(extension);
 		const fileName = path.split('/').pop() || path;
+		const parentPath = path.includes('/') ? path.split('/').slice(0, -1).join('/') : '';
+		const driveParentId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
+		const existingRemote = await this.findRemoteFileByName(driveParentId, parentPath, fileName);
+
+		if (state && existingRemote && state.driveId !== existingRemote.id) {
+			state = { ...state, driveId: existingRemote.id, remoteMtime: existingRemote.modifiedTime };
+			this.stateManager.set(path, state);
+			await this.flushStateIfNeeded();
+		}
 
 		if (!state) {
-			const parentPath = path.includes('/') ? path.split('/').slice(0, -1).join('/') : '';
-			const driveParentId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
-			
 			const upload = await this.readStableLocalFile(path, stat);
 			if (!upload) return;
-			const remoteFile = await this.client.uploadFile(fileName, driveParentId, upload.content, mimeType);
+			const remoteFile = existingRemote
+				? await this.client.updateFile(existingRemote.id, upload.content, mimeType)
+				: await this.client.uploadFile(fileName, driveParentId, upload.content, mimeType);
+			this.updateCachedRemoteFile(driveParentId, remoteFile);
 			
 			this.stateManager.set(path, {
 				driveId: remoteFile.id,
@@ -292,6 +319,7 @@ export class SyncEngine {
 			const upload = await this.readStableLocalFile(path, stat);
 			if (!upload) return;
 			const remoteFile = await this.client.updateFile(state.driveId, upload.content, mimeType);
+			this.updateCachedRemoteFile(driveParentId, remoteFile);
 			
 			this.stateManager.set(path, {
 				...state,
@@ -347,49 +375,175 @@ export class SyncEngine {
 		return remoteFolder.id;
 	}
 
+	private async findRemoteFileByName(folderId: string, parentPath: string, fileName: string): Promise<DriveFile | undefined> {
+		const items = await this.listCanonicalRemoteItems(folderId, parentPath);
+		const normalizedFileName = fileName.toLowerCase();
+		return items.find(item => item.mimeType !== GOOGLE_FOLDER_MIME_TYPE && item.name.toLowerCase() === normalizedFileName);
+	}
+
+	private async listCanonicalRemoteItems(folderId: string, parentPath: string): Promise<DriveFile[]> {
+		if (this.remoteFolderCache.has(folderId)) {
+			return this.remoteFolderCache.get(folderId)!;
+		}
+
+		const items = await this.client.listFiles(folderId);
+		const canonicalItems = await this.consolidateDuplicateRemoteFiles(folderId, parentPath, items);
+		this.remoteFolderCache.set(folderId, canonicalItems);
+		return canonicalItems;
+	}
+
+	private updateCachedRemoteFile(folderId: string, file: DriveFile) {
+		const cached = this.remoteFolderCache.get(folderId);
+		if (!cached) return;
+
+		const index = cached.findIndex(item => item.id === file.id);
+		if (index >= 0) {
+			cached[index] = file;
+		} else {
+			cached.push(file);
+		}
+	}
+
+	private async consolidateDuplicateRemoteFiles(folderId: string, parentPath: string, items: DriveFile[]): Promise<DriveFile[]> {
+		const fileGroups = new Map<string, DriveFile[]>();
+		const canonicalItems: DriveFile[] = [];
+
+		for (const item of items) {
+			if (this.canMergeRemoteFile(item)) {
+				const key = item.name.toLowerCase();
+				const group = fileGroups.get(key) || [];
+				group.push(item);
+				fileGroups.set(key, group);
+			} else {
+				canonicalItems.push(item);
+			}
+		}
+
+		for (const group of fileGroups.values()) {
+			if (group.length === 1) {
+				canonicalItems.push(group[0]);
+				continue;
+			}
+
+			try {
+				canonicalItems.push(await this.mergeDuplicateRemoteFiles(group, parentPath));
+			} catch (e) {
+				const displayName = parentPath ? `${parentPath}/${group[0].name}` : group[0].name;
+				console.error(`Failed to merge Drive duplicates for ${displayName}`, e);
+				this.stats.failed++;
+				this.stats.errors.push({ path: displayName, message: `Failed to merge duplicate Drive files: ${this.getErrorMessage(e)}` });
+				canonicalItems.push(this.chooseCanonicalRemoteFile(group, parentPath));
+			}
+		}
+
+		return canonicalItems;
+	}
+
+	private async mergeDuplicateRemoteFiles(group: DriveFile[], parentPath: string): Promise<DriveFile> {
+		const displayName = parentPath ? `${parentPath}/${group[0].name}` : group[0].name;
+		const sorted = [...group].sort((a, b) => new Date(a.modifiedTime).getTime() - new Date(b.modifiedTime).getTime());
+		const canonical = this.chooseCanonicalRemoteFile(sorted, parentPath);
+		const latest = sorted[sorted.length - 1];
+		const restoreCanonicalHead = latest.id === canonical.id;
+		const canonicalOriginalContent = restoreCanonicalHead ? await this.client.downloadFile(canonical.id) : null;
+		let canonicalFile = canonical;
+		let wroteRevision = false;
+
+		this.updateStatus(`Merging duplicates: ${displayName}`);
+
+		for (const duplicate of sorted) {
+			if (duplicate.id === canonical.id) continue;
+
+			if (!this.sameRemoteContent(canonicalFile, duplicate)) {
+				const duplicateContent = await this.client.downloadFile(duplicate.id);
+				canonicalFile = await this.client.updateFile(canonical.id, duplicateContent, duplicate.mimeType);
+				wroteRevision = true;
+			}
+
+			await this.client.deleteFile(duplicate.id);
+			this.repointStateEntry(duplicate.id, canonical.id, canonicalFile.modifiedTime);
+		}
+
+		if (restoreCanonicalHead && wroteRevision && canonicalOriginalContent) {
+			canonicalFile = await this.client.updateFile(canonical.id, canonicalOriginalContent, canonical.mimeType);
+		}
+
+		this.repointStateEntry(canonical.id, canonical.id, canonicalFile.modifiedTime);
+		await this.flushStateIfNeeded();
+		return { ...canonicalFile, name: canonical.name || canonicalFile.name };
+	}
+
+	private chooseCanonicalRemoteFile(group: DriveFile[], parentPath: string): DriveFile {
+		const stateMatch = group.find(item => {
+			const exactPath = parentPath ? `${parentPath}/${item.name}` : item.name;
+			return this.stateManager.get(exactPath)?.driveId === item.id ||
+				Object.values(this.stateManager.state).some(entry => entry.driveId === item.id);
+		});
+
+		if (stateMatch) return stateMatch;
+
+		return [...group].sort((a, b) => new Date(a.modifiedTime).getTime() - new Date(b.modifiedTime).getTime())[0];
+	}
+
+	private repointStateEntry(oldDriveId: string, newDriveId: string, remoteMtime: string) {
+		for (const [path, entry] of Object.entries(this.stateManager.state)) {
+			if (entry.driveId === oldDriveId) {
+				this.stateManager.set(path, {
+					...entry,
+					driveId: newDriveId,
+					remoteMtime
+				});
+			}
+		}
+	}
+
+	private canMergeRemoteFile(file: DriveFile): boolean {
+		return file.mimeType !== GOOGLE_FOLDER_MIME_TYPE && !file.mimeType.startsWith('application/vnd.google-apps.');
+	}
+
+	private sameRemoteContent(a: DriveFile, b: DriveFile): boolean {
+		return !!a.md5Checksum && !!b.md5Checksum && a.md5Checksum === b.md5Checksum;
+	}
+
 	private async processRemoteTree(folderId: string, remotePathSet: Set<string>, parentPath: string = '', depth: number = 0, locallyDeletedPaths: Set<string> = new Set()): Promise<void> {
 		if (depth > 50) throw new Error('Maximum folder depth reached.');
 		this.updateStatus(`Scanning Drive: ${parentPath || 'root'}...`);
 		
 		try {
-			let pageToken: string | undefined;
+			const items = await this.listCanonicalRemoteItems(folderId, parentPath);
 
-			do {
-				const page = await this.client.listFilesPage(folderId, pageToken);
+			for (const item of items) {
+				const path = parentPath ? `${parentPath}/${item.name}` : item.name;
+				if (this.isLocallyDeletedPath(path, locallyDeletedPaths)) {
+					continue;
+				}
 
-				for (const item of page.files) {
-					const path = parentPath ? `${parentPath}/${item.name}` : item.name;
-					if (this.isLocallyDeletedPath(path, locallyDeletedPaths)) {
-						continue;
-					}
+				remotePathSet.add(path);
 
-					remotePathSet.add(path);
+				if (this.isExcluded(path)) continue;
 
-					if (this.isExcluded(path)) continue;
-
-					try {
-						this.stats.currentFile = path;
-						await this.processRemoteFile(path, item);
-					} catch (e) {
-						console.error(`Failed to pull ${path}`, e);
-						if (this.isNotFound(e)) {
-							this.stateManager.remove(path);
-						} else {
-							this.stats.failed++;
-							this.stats.errors.push({ path, message: this.getErrorMessage(e) });
-						}
-					}
-
-					this.updateStatus(this.stats.status);
-					await this.afterWorkItem();
-
-					if (item.mimeType === 'application/vnd.google-apps.folder') {
-						await this.processRemoteTree(item.id, remotePathSet, path, depth + 1, locallyDeletedPaths);
+				try {
+					this.stats.processed++;
+					this.stats.totalFiles = Math.max(this.stats.totalFiles, this.stats.processed);
+					this.stats.currentFile = path;
+					await this.processRemoteFile(path, item);
+				} catch (e) {
+					console.error(`Failed to pull ${path}`, e);
+					if (this.isNotFound(e)) {
+						this.stateManager.remove(path);
+					} else {
+						this.stats.failed++;
+						this.stats.errors.push({ path, message: this.getErrorMessage(e) });
 					}
 				}
 
-				pageToken = page.nextPageToken;
-			} while (pageToken);
+				this.updateStatus(this.stats.status);
+				await this.afterWorkItem();
+
+				if (item.mimeType === GOOGLE_FOLDER_MIME_TYPE) {
+					await this.processRemoteTree(item.id, remotePathSet, path, depth + 1, locallyDeletedPaths);
+				}
+			}
 		} catch (error) {
 			console.error(`Failed to scan Drive folder ${folderId}`, error);
 			throw error;
@@ -432,7 +586,13 @@ export class SyncEngine {
 			return;
 		}
 
-		const state = this.stateManager.get(path);
+		let state = this.stateManager.get(path);
+		if (state && state.driveId !== remoteFile.id) {
+			state = { ...state, driveId: remoteFile.id };
+			this.stateManager.set(path, state);
+			await this.flushStateIfNeeded();
+		}
+
 		const existsLocal = await this.app.vault.adapter.exists(path);
 		const localStat = existsLocal ? await this.app.vault.adapter.stat(path) : null;
 
@@ -458,7 +618,7 @@ export class SyncEngine {
 						await this.flushStateIfNeeded();
 					}
 				} else {
-					await this.handleConflict(path, remoteFile);
+					await this.download(path, remoteFile);
 				}
 			} else {
 				await this.download(path, remoteFile);
@@ -479,7 +639,7 @@ export class SyncEngine {
 						await this.flushStateIfNeeded();
 					}
 				} else {
-					await this.handleConflict(path, remoteFile);
+					await this.download(path, remoteFile);
 				}
 			} else {
 				await this.download(path, remoteFile);
@@ -615,43 +775,6 @@ export class SyncEngine {
 				throw e;
 			}
 		}
-	}
-
-	private async handleConflict(path: string, remoteFile: DriveFile) {
-		const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-		const lastDotIndex = path.lastIndexOf('.');
-		const conflictPath = lastDotIndex !== -1 
-			? path.slice(0, lastDotIndex) + ` (conflict ${timestamp})` + path.slice(lastDotIndex)
-			: `${path} (conflict ${timestamp})`;
-		
-		const content = await this.client.downloadFile(remoteFile.id);
-		
-		const parts = conflictPath.split('/');
-		if (parts.length > 1) {
-			const folderPath = parts.slice(0, -1).join('/');
-			await this.ensureLocalPath(folderPath);
-		}
-
-		await this.app.vault.adapter.writeBinary(conflictPath, content);
-		
-		if (!this.silent) {
-			new Notice(`Conflict detected for ${path}. Kept both versions.`);
-		}
-		
-		this.stats.conflicts.push({
-			path: conflictPath,
-			originalPath: path,
-			timestamp: timestamp
-		});
-
-		const stat = await this.app.vault.adapter.stat(conflictPath);
-		this.stateManager.set(conflictPath, {
-			driveId: remoteFile.id,
-			lastSyncedMtime: stat ? stat.mtime : Date.now(),
-			remoteMtime: remoteFile.modifiedTime,
-			etag: ''
-		});
-		await this.flushStateIfNeeded();
 	}
 
 	private async hasUnsyncedLocalDescendant(folderPath: string): Promise<boolean> {

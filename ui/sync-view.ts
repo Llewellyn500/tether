@@ -62,6 +62,7 @@ export class SyncStatusView extends ItemView {
 		container.addClass('gdrive-sync-view');
 
 		container.createEl('h3', { text: 'Sync Status' });
+		this.createSyncActions(container);
 
 		const statsGrid = container.createDiv({ cls: 'sync-stats-grid' });
 		
@@ -145,6 +146,22 @@ export class SyncStatusView extends ItemView {
 		const stat = parent.createDiv({ cls: 'sync-stat' });
 		stat.createDiv({ text: label, cls: 'stat-label' });
 		stat.createDiv({ text: value, cls: 'stat-value ' + cls });
+	}
+
+	private createSyncActions(parent: Element) {
+		const plugin = (this.app as any).plugins.getPlugin('tether');
+		const actions = parent.createDiv({ cls: 'sync-action-row' });
+
+		const pullButton = actions.createEl('button', { text: 'Pull', cls: 'mod-cta' });
+		pullButton.onClickEvent(() => plugin?.pullSync?.());
+
+		const pushButton = actions.createEl('button', { text: 'Push' });
+		pushButton.onClickEvent(() => plugin?.pushSync?.());
+
+		if (!plugin) {
+			pullButton.disabled = true;
+			pushButton.disabled = true;
+		}
 	}
 
 	private isConfigPath(path: string): boolean {

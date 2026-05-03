@@ -303,7 +303,7 @@ var GoogleDriveClient = class {
       parents: [folderId],
       mimeType
     };
-    const initUrl = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable";
+    const initUrl = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,mimeType,modifiedTime,md5Checksum,size";
     const initResponse = await this.request({
       url: initUrl,
       method: "POST",
@@ -327,7 +327,7 @@ var GoogleDriveClient = class {
     return uploadResponse.json;
   }
   async updateFile(fileId, content, mimeType = "text/markdown") {
-    const initUrl = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=resumable`;
+    const initUrl = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=resumable&fields=id,name,mimeType,modifiedTime,md5Checksum,size`;
     const initResponse = await this.request({
       url: initUrl,
       method: "PATCH",
@@ -409,6 +409,7 @@ var SyncStatusView = class extends import_obsidian4.ItemView {
     container.empty();
     container.addClass("gdrive-sync-view");
     container.createEl("h3", { text: "Sync Status" });
+    this.createSyncActions(container);
     const statsGrid = container.createDiv({ cls: "sync-stats-grid" });
     this.createStat(statsGrid, "Status", this.stats.status);
     this.createStat(statsGrid, "Progress", `${this.stats.processed} / ${this.stats.totalFiles}`);
@@ -483,6 +484,24 @@ ${conflict.path}`)) {
     stat.createDiv({ text: label, cls: "stat-label" });
     stat.createDiv({ text: value, cls: "stat-value " + cls });
   }
+  createSyncActions(parent) {
+    const plugin = this.app.plugins.getPlugin("tether");
+    const actions = parent.createDiv({ cls: "sync-action-row" });
+    const pullButton = actions.createEl("button", { text: "Pull", cls: "mod-cta" });
+    pullButton.onClickEvent(() => {
+      var _a;
+      return (_a = plugin == null ? void 0 : plugin.pullSync) == null ? void 0 : _a.call(plugin);
+    });
+    const pushButton = actions.createEl("button", { text: "Push" });
+    pushButton.onClickEvent(() => {
+      var _a;
+      return (_a = plugin == null ? void 0 : plugin.pushSync) == null ? void 0 : _a.call(plugin);
+    });
+    if (!plugin) {
+      pullButton.disabled = true;
+      pushButton.disabled = true;
+    }
+  }
   isConfigPath(path) {
     const configDir = this.app.vault.configDir || ".obsidian";
     return path === configDir || path.startsWith(`${configDir}/`);
@@ -497,9 +516,11 @@ var STATE_SAVE_INTERVAL_MS = 1e4;
 var MANUAL_STATUS_UPDATE_MS = 500;
 var BACKGROUND_STATUS_UPDATE_MS = 3e3;
 var WORK_YIELD_ITEM_LIMIT = 25;
+var GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
 var SyncEngine = class {
   constructor(app, client, stateManager, folderId, statusBarItem) {
     this.folderCache = /* @__PURE__ */ new Map();
+    this.remoteFolderCache = /* @__PURE__ */ new Map();
     this.silent = false;
     this.statusUpdateIntervalMs = MANUAL_STATUS_UPDATE_MS;
     this.lastStatusUpdateAt = 0;
@@ -538,7 +559,7 @@ var SyncEngine = class {
     }
   }
   async sync(options = {}) {
-    var _a, _b;
+    var _a, _b, _c;
     if (!this.folderId) {
       new import_obsidian5.Notice("Google Drive folder ID not set.");
       return;
@@ -553,53 +574,33 @@ var SyncEngine = class {
       this.stats.processed = 0;
       this.stats.failed = 0;
       this.stats.errors = [];
+      this.stats.conflicts = [];
       this.stats.deferred = [];
       this.folderCache.clear();
+      this.remoteFolderCache.clear();
+      const mode = (_c = options.mode) != null ? _c : "push";
+      const modeLabel = mode === "pull" ? "Pull" : "Push";
       this.updateStatus("Loading state...", void 0, true);
       await this.stateManager.load();
       const vaultName = this.app.vault.getName();
       this.updateStatus(`Locating vault root...`);
       const vaultRootDriveId = await this.ensureVaultRoot(vaultName);
       this.folderCache.set("", vaultRootDriveId);
-      this.updateStatus("Scanning local items...");
-      const localPathSet = await this.collectLocalPathSet("");
-      this.stats.totalFiles = localPathSet.size;
-      const locallyDeletedPaths = await this.handleLocalDeletions(localPathSet);
-      this.updateStatus("Pulling changes...");
-      const remotePathSet = /* @__PURE__ */ new Set();
-      await this.processRemoteTree(vaultRootDriveId, remotePathSet, "", 0, locallyDeletedPaths);
-      await this.handleRemoteDeletions(remotePathSet);
-      this.updateStatus("Pushing changes...");
-      for (const path of localPathSet) {
-        this.stats.processed++;
-        this.stats.currentFile = path;
-        if (this.stats.processed % 10 === 0 || this.stats.processed === this.stats.totalFiles) {
-          this.updateStatus(`Syncing ${this.stats.processed}/${this.stats.totalFiles}${this.stats.failed ? ` (${this.stats.failed} failed)` : ""}`);
-        }
-        try {
-          await this.processLocalPath(path, vaultRootDriveId);
-        } catch (e) {
-          console.error(`Failed to push ${path}`, e);
-          if (this.isNotFound(e)) {
-            this.stateManager.remove(path);
-          } else {
-            this.stats.failed++;
-            this.stats.errors.push({ path, message: this.getErrorMessage(e) });
-          }
-        }
-        this.updateStatus(this.stats.status);
-        await this.afterWorkItem();
+      if (mode === "pull") {
+        await this.pullFromRemote(vaultRootDriveId);
+      } else {
+        await this.pushToRemote(vaultRootDriveId);
       }
       this.stats.lastSync = new Date().toLocaleTimeString();
       this.stats.currentFile = "";
       await this.flushStateIfNeeded(true);
       this.updateStatus("Idle", void 0, true);
       if (!this.silent && this.stats.failed > 0) {
-        new import_obsidian5.Notice(`Sync complete with ${this.stats.failed} errors. Check sidebar.`);
+        new import_obsidian5.Notice(`${modeLabel} complete with ${this.stats.failed} errors. Check sidebar.`);
       } else if (!this.silent && this.stats.deferred.length > 0) {
-        new import_obsidian5.Notice(`Sync complete. Deferred ${this.stats.deferred.length} active file${this.stats.deferred.length === 1 ? "" : "s"} until editing stops.`);
+        new import_obsidian5.Notice(`${modeLabel} complete. Deferred ${this.stats.deferred.length} active file${this.stats.deferred.length === 1 ? "" : "s"} until editing stops.`);
       } else if (!this.silent) {
-        new import_obsidian5.Notice("Sync complete successfully!");
+        new import_obsidian5.Notice(`${modeLabel} complete successfully!`);
       }
     } catch (error) {
       this.updateStatus("Failed", void 0, true);
@@ -608,6 +609,41 @@ var SyncEngine = class {
     } finally {
       this.silent = previousSilent;
       this.statusUpdateIntervalMs = previousStatusUpdateIntervalMs;
+    }
+  }
+  async pullFromRemote(vaultRootDriveId) {
+    this.stats.processed = 0;
+    this.stats.totalFiles = 0;
+    this.updateStatus("Pulling changes...");
+    const remotePathSet = /* @__PURE__ */ new Set();
+    await this.processRemoteTree(vaultRootDriveId, remotePathSet);
+    await this.handleRemoteDeletions(remotePathSet);
+  }
+  async pushToRemote(vaultRootDriveId) {
+    this.updateStatus("Scanning local items...");
+    const localPathSet = await this.collectLocalPathSet("");
+    this.stats.totalFiles = localPathSet.size;
+    await this.handleLocalDeletions(localPathSet);
+    this.updateStatus("Pushing changes...");
+    for (const path of localPathSet) {
+      this.stats.processed++;
+      this.stats.currentFile = path;
+      if (this.stats.processed % 10 === 0 || this.stats.processed === this.stats.totalFiles) {
+        this.updateStatus(`Pushing ${this.stats.processed}/${this.stats.totalFiles}${this.stats.failed ? ` (${this.stats.failed} failed)` : ""}`);
+      }
+      try {
+        await this.processLocalPath(path, vaultRootDriveId);
+      } catch (e) {
+        console.error(`Failed to push ${path}`, e);
+        if (this.isNotFound(e)) {
+          this.stateManager.remove(path);
+        } else {
+          this.stats.failed++;
+          this.stats.errors.push({ path, message: this.getErrorMessage(e) });
+        }
+      }
+      this.updateStatus(this.stats.status);
+      await this.afterWorkItem();
     }
   }
   isExcluded(path) {
@@ -692,17 +728,24 @@ var SyncEngine = class {
     if (await this.shouldDeferActiveLocalFile(path, stat)) {
       return;
     }
-    const state = this.stateManager.get(path);
+    let state = this.stateManager.get(path);
     const extension = path.includes(".") ? path.split(".").pop() || "" : "";
     const mimeType = this.getMimeType(extension);
     const fileName = path.split("/").pop() || path;
+    const parentPath = path.includes("/") ? path.split("/").slice(0, -1).join("/") : "";
+    const driveParentId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
+    const existingRemote = await this.findRemoteFileByName(driveParentId, parentPath, fileName);
+    if (state && existingRemote && state.driveId !== existingRemote.id) {
+      state = { ...state, driveId: existingRemote.id, remoteMtime: existingRemote.modifiedTime };
+      this.stateManager.set(path, state);
+      await this.flushStateIfNeeded();
+    }
     if (!state) {
-      const parentPath = path.includes("/") ? path.split("/").slice(0, -1).join("/") : "";
-      const driveParentId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
       const upload = await this.readStableLocalFile(path, stat);
       if (!upload)
         return;
-      const remoteFile = await this.client.uploadFile(fileName, driveParentId, upload.content, mimeType);
+      const remoteFile = existingRemote ? await this.client.updateFile(existingRemote.id, upload.content, mimeType) : await this.client.uploadFile(fileName, driveParentId, upload.content, mimeType);
+      this.updateCachedRemoteFile(driveParentId, remoteFile);
       this.stateManager.set(path, {
         driveId: remoteFile.id,
         lastSyncedMtime: upload.stat.mtime,
@@ -716,6 +759,7 @@ var SyncEngine = class {
       if (!upload)
         return;
       const remoteFile = await this.client.updateFile(state.driveId, upload.content, mimeType);
+      this.updateCachedRemoteFile(driveParentId, remoteFile);
       this.stateManager.set(path, {
         ...state,
         lastSyncedMtime: upload.stat.mtime,
@@ -763,42 +807,150 @@ var SyncEngine = class {
     await this.flushStateIfNeeded();
     return remoteFolder.id;
   }
+  async findRemoteFileByName(folderId, parentPath, fileName) {
+    const items = await this.listCanonicalRemoteItems(folderId, parentPath);
+    const normalizedFileName = fileName.toLowerCase();
+    return items.find((item) => item.mimeType !== GOOGLE_FOLDER_MIME_TYPE && item.name.toLowerCase() === normalizedFileName);
+  }
+  async listCanonicalRemoteItems(folderId, parentPath) {
+    if (this.remoteFolderCache.has(folderId)) {
+      return this.remoteFolderCache.get(folderId);
+    }
+    const items = await this.client.listFiles(folderId);
+    const canonicalItems = await this.consolidateDuplicateRemoteFiles(folderId, parentPath, items);
+    this.remoteFolderCache.set(folderId, canonicalItems);
+    return canonicalItems;
+  }
+  updateCachedRemoteFile(folderId, file) {
+    const cached = this.remoteFolderCache.get(folderId);
+    if (!cached)
+      return;
+    const index = cached.findIndex((item) => item.id === file.id);
+    if (index >= 0) {
+      cached[index] = file;
+    } else {
+      cached.push(file);
+    }
+  }
+  async consolidateDuplicateRemoteFiles(folderId, parentPath, items) {
+    const fileGroups = /* @__PURE__ */ new Map();
+    const canonicalItems = [];
+    for (const item of items) {
+      if (this.canMergeRemoteFile(item)) {
+        const key = item.name.toLowerCase();
+        const group = fileGroups.get(key) || [];
+        group.push(item);
+        fileGroups.set(key, group);
+      } else {
+        canonicalItems.push(item);
+      }
+    }
+    for (const group of fileGroups.values()) {
+      if (group.length === 1) {
+        canonicalItems.push(group[0]);
+        continue;
+      }
+      try {
+        canonicalItems.push(await this.mergeDuplicateRemoteFiles(group, parentPath));
+      } catch (e) {
+        const displayName = parentPath ? `${parentPath}/${group[0].name}` : group[0].name;
+        console.error(`Failed to merge Drive duplicates for ${displayName}`, e);
+        this.stats.failed++;
+        this.stats.errors.push({ path: displayName, message: `Failed to merge duplicate Drive files: ${this.getErrorMessage(e)}` });
+        canonicalItems.push(this.chooseCanonicalRemoteFile(group, parentPath));
+      }
+    }
+    return canonicalItems;
+  }
+  async mergeDuplicateRemoteFiles(group, parentPath) {
+    const displayName = parentPath ? `${parentPath}/${group[0].name}` : group[0].name;
+    const sorted = [...group].sort((a, b) => new Date(a.modifiedTime).getTime() - new Date(b.modifiedTime).getTime());
+    const canonical = this.chooseCanonicalRemoteFile(sorted, parentPath);
+    const latest = sorted[sorted.length - 1];
+    const restoreCanonicalHead = latest.id === canonical.id;
+    const canonicalOriginalContent = restoreCanonicalHead ? await this.client.downloadFile(canonical.id) : null;
+    let canonicalFile = canonical;
+    let wroteRevision = false;
+    this.updateStatus(`Merging duplicates: ${displayName}`);
+    for (const duplicate of sorted) {
+      if (duplicate.id === canonical.id)
+        continue;
+      if (!this.sameRemoteContent(canonicalFile, duplicate)) {
+        const duplicateContent = await this.client.downloadFile(duplicate.id);
+        canonicalFile = await this.client.updateFile(canonical.id, duplicateContent, duplicate.mimeType);
+        wroteRevision = true;
+      }
+      await this.client.deleteFile(duplicate.id);
+      this.repointStateEntry(duplicate.id, canonical.id, canonicalFile.modifiedTime);
+    }
+    if (restoreCanonicalHead && wroteRevision && canonicalOriginalContent) {
+      canonicalFile = await this.client.updateFile(canonical.id, canonicalOriginalContent, canonical.mimeType);
+    }
+    this.repointStateEntry(canonical.id, canonical.id, canonicalFile.modifiedTime);
+    await this.flushStateIfNeeded();
+    return { ...canonicalFile, name: canonical.name || canonicalFile.name };
+  }
+  chooseCanonicalRemoteFile(group, parentPath) {
+    const stateMatch = group.find((item) => {
+      var _a;
+      const exactPath = parentPath ? `${parentPath}/${item.name}` : item.name;
+      return ((_a = this.stateManager.get(exactPath)) == null ? void 0 : _a.driveId) === item.id || Object.values(this.stateManager.state).some((entry) => entry.driveId === item.id);
+    });
+    if (stateMatch)
+      return stateMatch;
+    return [...group].sort((a, b) => new Date(a.modifiedTime).getTime() - new Date(b.modifiedTime).getTime())[0];
+  }
+  repointStateEntry(oldDriveId, newDriveId, remoteMtime) {
+    for (const [path, entry] of Object.entries(this.stateManager.state)) {
+      if (entry.driveId === oldDriveId) {
+        this.stateManager.set(path, {
+          ...entry,
+          driveId: newDriveId,
+          remoteMtime
+        });
+      }
+    }
+  }
+  canMergeRemoteFile(file) {
+    return file.mimeType !== GOOGLE_FOLDER_MIME_TYPE && !file.mimeType.startsWith("application/vnd.google-apps.");
+  }
+  sameRemoteContent(a, b) {
+    return !!a.md5Checksum && !!b.md5Checksum && a.md5Checksum === b.md5Checksum;
+  }
   async processRemoteTree(folderId, remotePathSet, parentPath = "", depth = 0, locallyDeletedPaths = /* @__PURE__ */ new Set()) {
     if (depth > 50)
       throw new Error("Maximum folder depth reached.");
     this.updateStatus(`Scanning Drive: ${parentPath || "root"}...`);
     try {
-      let pageToken;
-      do {
-        const page = await this.client.listFilesPage(folderId, pageToken);
-        for (const item of page.files) {
-          const path = parentPath ? `${parentPath}/${item.name}` : item.name;
-          if (this.isLocallyDeletedPath(path, locallyDeletedPaths)) {
-            continue;
-          }
-          remotePathSet.add(path);
-          if (this.isExcluded(path))
-            continue;
-          try {
-            this.stats.currentFile = path;
-            await this.processRemoteFile(path, item);
-          } catch (e) {
-            console.error(`Failed to pull ${path}`, e);
-            if (this.isNotFound(e)) {
-              this.stateManager.remove(path);
-            } else {
-              this.stats.failed++;
-              this.stats.errors.push({ path, message: this.getErrorMessage(e) });
-            }
-          }
-          this.updateStatus(this.stats.status);
-          await this.afterWorkItem();
-          if (item.mimeType === "application/vnd.google-apps.folder") {
-            await this.processRemoteTree(item.id, remotePathSet, path, depth + 1, locallyDeletedPaths);
+      const items = await this.listCanonicalRemoteItems(folderId, parentPath);
+      for (const item of items) {
+        const path = parentPath ? `${parentPath}/${item.name}` : item.name;
+        if (this.isLocallyDeletedPath(path, locallyDeletedPaths)) {
+          continue;
+        }
+        remotePathSet.add(path);
+        if (this.isExcluded(path))
+          continue;
+        try {
+          this.stats.processed++;
+          this.stats.totalFiles = Math.max(this.stats.totalFiles, this.stats.processed);
+          this.stats.currentFile = path;
+          await this.processRemoteFile(path, item);
+        } catch (e) {
+          console.error(`Failed to pull ${path}`, e);
+          if (this.isNotFound(e)) {
+            this.stateManager.remove(path);
+          } else {
+            this.stats.failed++;
+            this.stats.errors.push({ path, message: this.getErrorMessage(e) });
           }
         }
-        pageToken = page.nextPageToken;
-      } while (pageToken);
+        this.updateStatus(this.stats.status);
+        await this.afterWorkItem();
+        if (item.mimeType === GOOGLE_FOLDER_MIME_TYPE) {
+          await this.processRemoteTree(item.id, remotePathSet, path, depth + 1, locallyDeletedPaths);
+        }
+      }
     } catch (error) {
       console.error(`Failed to scan Drive folder ${folderId}`, error);
       throw error;
@@ -836,7 +988,12 @@ var SyncEngine = class {
       await this.flushStateIfNeeded();
       return;
     }
-    const state = this.stateManager.get(path);
+    let state = this.stateManager.get(path);
+    if (state && state.driveId !== remoteFile.id) {
+      state = { ...state, driveId: remoteFile.id };
+      this.stateManager.set(path, state);
+      await this.flushStateIfNeeded();
+    }
     const existsLocal = await this.app.vault.adapter.exists(path);
     const localStat = existsLocal ? await this.app.vault.adapter.stat(path) : null;
     if ((localStat == null ? void 0 : localStat.type) === "file" && await this.shouldDeferActiveLocalFile(path, localStat)) {
@@ -858,7 +1015,7 @@ var SyncEngine = class {
             await this.flushStateIfNeeded();
           }
         } else {
-          await this.handleConflict(path, remoteFile);
+          await this.download(path, remoteFile);
         }
       } else {
         await this.download(path, remoteFile);
@@ -877,7 +1034,7 @@ var SyncEngine = class {
             await this.flushStateIfNeeded();
           }
         } else {
-          await this.handleConflict(path, remoteFile);
+          await this.download(path, remoteFile);
         }
       } else {
         await this.download(path, remoteFile);
@@ -993,34 +1150,6 @@ var SyncEngine = class {
         throw e;
       }
     }
-  }
-  async handleConflict(path, remoteFile) {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const lastDotIndex = path.lastIndexOf(".");
-    const conflictPath = lastDotIndex !== -1 ? path.slice(0, lastDotIndex) + ` (conflict ${timestamp})` + path.slice(lastDotIndex) : `${path} (conflict ${timestamp})`;
-    const content = await this.client.downloadFile(remoteFile.id);
-    const parts = conflictPath.split("/");
-    if (parts.length > 1) {
-      const folderPath = parts.slice(0, -1).join("/");
-      await this.ensureLocalPath(folderPath);
-    }
-    await this.app.vault.adapter.writeBinary(conflictPath, content);
-    if (!this.silent) {
-      new import_obsidian5.Notice(`Conflict detected for ${path}. Kept both versions.`);
-    }
-    this.stats.conflicts.push({
-      path: conflictPath,
-      originalPath: path,
-      timestamp
-    });
-    const stat = await this.app.vault.adapter.stat(conflictPath);
-    this.stateManager.set(conflictPath, {
-      driveId: remoteFile.id,
-      lastSyncedMtime: stat ? stat.mtime : Date.now(),
-      remoteMtime: remoteFile.modifiedTime,
-      etag: ""
-    });
-    await this.flushStateIfNeeded();
   }
   async hasUnsyncedLocalDescendant(folderPath) {
     const descendants = await this.listAllLocalItems(folderPath);
@@ -1339,7 +1468,8 @@ var DEFAULT_SETTINGS = {
   folderId: "",
   folderName: "",
   syncInterval: 15,
-  syncOnStartup: true
+  syncOnStartup: true,
+  initialPullComplete: false
 };
 var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
   constructor() {
@@ -1372,14 +1502,28 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
         }, 5e3);
       }
     }
-    const ribbonIconEl = this.addRibbonIcon("cloud", "Sync with Google Drive", (evt) => {
-      this.manualSync();
+    const pullRibbonIconEl = this.addRibbonIcon("cloud-download", "Pull from Google Drive", (evt) => {
+      this.pullSync();
     });
-    ribbonIconEl.addClass("gdrive-sync-ribbon-icon");
+    pullRibbonIconEl.addClass("gdrive-sync-ribbon-icon");
+    const pushRibbonIconEl = this.addRibbonIcon("cloud-upload", "Push to Google Drive", (evt) => {
+      this.pushSync();
+    });
+    pushRibbonIconEl.addClass("gdrive-sync-ribbon-icon");
     this.addCommand({
       id: "sync-google-drive",
-      name: "Sync with Google Drive",
+      name: "Run Next Tether Sync",
       callback: () => this.manualSync()
+    });
+    this.addCommand({
+      id: "pull-google-drive",
+      name: "Pull from Google Drive",
+      callback: () => this.pullSync()
+    });
+    this.addCommand({
+      id: "push-google-drive",
+      name: "Push to Google Drive",
+      callback: () => this.pushSync()
     });
     this.addCommand({
       id: "open-gdrive-sync-status",
@@ -1437,8 +1581,12 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
   async saveSettings() {
     var _a, _b, _c, _d;
     const oldFolderId = (_a = await this.loadData()) == null ? void 0 : _a.folderId;
+    const folderChanged = !!this.settings.folderId && this.settings.folderId !== oldFolderId;
+    if (folderChanged) {
+      this.settings.initialPullComplete = false;
+    }
     await this.saveData(this.settings);
-    if (this.settings.folderId && this.settings.folderId !== oldFolderId) {
+    if (folderChanged) {
       new import_obsidian8.Notice("Sync folder changed. Resetting local sync state...");
       const statePath = (_d = (_c = (_b = this.stateManager) == null ? void 0 : _b.getStatePath) == null ? void 0 : _c.call(_b)) != null ? _d : `${this.app.vault.configDir || ".obsidian"}/gdrive-sync.json`;
       await this.app.vault.adapter.remove(statePath).catch(() => {
@@ -1452,6 +1600,16 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     }
   }
   async manualSync() {
+    await this.runSync(this.settings.initialPullComplete ? "push" : "pull");
+  }
+  async pullSync() {
+    await this.runSync("pull");
+  }
+  async pushSync() {
+    await this.runSync("push");
+  }
+  async runSync(mode, options = {}) {
+    var _a;
     if (this.isSyncing) {
       new import_obsidian8.Notice("Sync is already in progress.");
       return;
@@ -1465,14 +1623,24 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       return;
     }
     this.isSyncing = true;
-    await this.activateView();
+    if ((_a = options.revealStatus) != null ? _a : true) {
+      await this.activateView();
+    }
     this.setupSyncEngine();
-    new import_obsidian8.Notice("Starting Tether Sync...");
+    if (!options.silent) {
+      new import_obsidian8.Notice(`Starting Tether ${mode}...`);
+    }
     try {
-      await this.syncEngine.sync();
+      await this.syncEngine.sync({ mode, silent: options.silent });
+      if (mode === "pull" && this.syncEngine.stats.failed === 0 && this.syncEngine.stats.deferred.length === 0) {
+        this.settings.initialPullComplete = true;
+        await this.saveSettings();
+      }
     } catch (error) {
-      console.error("Sync failed", error);
-      new import_obsidian8.Notice(`Sync failed: ${error instanceof Error ? error.message : String(error)}`);
+      console.error(`${mode} failed`, error);
+      if (!options.silent) {
+        new import_obsidian8.Notice(`${mode === "pull" ? "Pull" : "Push"} failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     } finally {
       this.isSyncing = false;
     }
@@ -1482,15 +1650,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       return;
     if (Date.now() - this.lastLocalChangeAt < BACKGROUND_SYNC_IDLE_DELAY_MS)
       return;
-    this.isSyncing = true;
-    this.setupSyncEngine();
-    try {
-      await this.syncEngine.sync({ silent: true });
-    } catch (error) {
-      console.error("Background sync failed", error);
-    } finally {
-      this.isSyncing = false;
-    }
+    await this.runSync(this.settings.initialPullComplete ? "push" : "pull", { silent: true, revealStatus: false });
   }
   async startLogin() {
     if (!this.settings.clientId || !this.settings.clientSecret) {
@@ -1648,7 +1808,7 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
       this.plugin.settings.syncInterval = parseInt(value) || 0;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(step4).setName("Manual Sync").setDesc("Trigger a sync immediately.").addButton((btn) => btn.setButtonText("Sync Now").onClick(() => this.plugin.manualSync()));
+    new import_obsidian8.Setting(step4).setName("Manual Sync").setDesc(this.plugin.settings.initialPullComplete ? "Next automatic sync will push local changes." : "Next automatic sync will pull from Google Drive first.").addButton((btn) => btn.setButtonText("Pull").onClick(() => this.plugin.pullSync())).addButton((btn) => btn.setButtonText("Push").setCta().onClick(() => this.plugin.pushSync()));
   }
 };
 module.exports = __toCommonJS(main_exports);

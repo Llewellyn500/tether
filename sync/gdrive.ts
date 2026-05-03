@@ -176,7 +176,7 @@ export class GoogleDriveClient {
 			mimeType
 		};
 
-		const initUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable';
+		const initUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,mimeType,modifiedTime,md5Checksum,size';
 		const initResponse = await this.request({
 			url: initUrl,
 			method: 'POST',
@@ -203,7 +203,7 @@ export class GoogleDriveClient {
 	}
 
 	async updateFile(fileId: string, content: ArrayBuffer | string, mimeType = 'text/markdown'): Promise<DriveFile> {
-		const initUrl = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=resumable`;
+		const initUrl = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=resumable&fields=id,name,mimeType,modifiedTime,md5Checksum,size`;
 		const initResponse = await this.request({
 			url: initUrl,
 			method: 'PATCH',

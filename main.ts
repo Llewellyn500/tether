@@ -1,7 +1,7 @@
 import { App, Plugin, PluginSettingTab, Setting, Notice, addIcon, WorkspaceLeaf } from 'obsidian';
 import { StateManager } from './sync/state';
 import { GoogleDriveClient } from './sync/gdrive';
-import { SyncEngine } from './sync/engine';
+import { SyncEngine, SyncMode } from './sync/engine';
 import { FolderSuggestModal } from './ui/folder-modal';
 import { SetupGuideModal } from './ui/setup-guide';
 import { OAuthManager } from './auth/oauth';
@@ -21,6 +21,7 @@ interface GoogleDriveSyncSettings {
 	folderName: string;
 	syncInterval: number;
 	syncOnStartup: boolean;
+	initialPullComplete: boolean;
 }
 
 const DEFAULT_SETTINGS: GoogleDriveSyncSettings = {
@@ -35,6 +36,7 @@ const DEFAULT_SETTINGS: GoogleDriveSyncSettings = {
 	folderName: '',
 	syncInterval: 15,
 	syncOnStartup: true,
+	initialPullComplete: false,
 }
 
 export default class GoogleDriveSyncPlugin extends Plugin {
@@ -81,17 +83,34 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 			}
 		}
 
-		// Add ribbon icon
-		const ribbonIconEl = this.addRibbonIcon('cloud', 'Sync with Google Drive', (evt: MouseEvent) => {
-			this.manualSync();
+		// Add ribbon icons
+		const pullRibbonIconEl = this.addRibbonIcon('cloud-download', 'Pull from Google Drive', (evt: MouseEvent) => {
+			this.pullSync();
 		});
-		ribbonIconEl.addClass('gdrive-sync-ribbon-icon');
+		pullRibbonIconEl.addClass('gdrive-sync-ribbon-icon');
+
+		const pushRibbonIconEl = this.addRibbonIcon('cloud-upload', 'Push to Google Drive', (evt: MouseEvent) => {
+			this.pushSync();
+		});
+		pushRibbonIconEl.addClass('gdrive-sync-ribbon-icon');
 
 		// Add command palette shortcuts
 		this.addCommand({
 			id: 'sync-google-drive',
-			name: 'Sync with Google Drive',
+			name: 'Run Next Tether Sync',
 			callback: () => this.manualSync()
+		});
+
+		this.addCommand({
+			id: 'pull-google-drive',
+			name: 'Pull from Google Drive',
+			callback: () => this.pullSync()
+		});
+
+		this.addCommand({
+			id: 'push-google-drive',
+			name: 'Push to Google Drive',
+			callback: () => this.pushSync()
 		});
 
 		this.addCommand({
@@ -165,9 +184,13 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 
 	async saveSettings() {
 		const oldFolderId = (await this.loadData())?.folderId;
+		const folderChanged = !!this.settings.folderId && this.settings.folderId !== oldFolderId;
+		if (folderChanged) {
+			this.settings.initialPullComplete = false;
+		}
 		await this.saveData(this.settings);
 		
-		if (this.settings.folderId && this.settings.folderId !== oldFolderId) {
+		if (folderChanged) {
 			new Notice('Sync folder changed. Resetting local sync state...');
 			const statePath = this.stateManager?.getStatePath?.() ?? `${this.app.vault.configDir || '.obsidian'}/gdrive-sync.json`;
 			await this.app.vault.adapter.remove(statePath).catch(() => {});
@@ -181,6 +204,18 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	}
 
 	async manualSync() {
+		await this.runSync(this.settings.initialPullComplete ? 'push' : 'pull');
+	}
+
+	async pullSync() {
+		await this.runSync('pull');
+	}
+
+	async pushSync() {
+		await this.runSync('push');
+	}
+
+	private async runSync(mode: SyncMode, options: { silent?: boolean, revealStatus?: boolean } = {}) {
 		if (this.isSyncing) {
 			new Notice('Sync is already in progress.');
 			return;
@@ -195,15 +230,25 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		}
 		
 		this.isSyncing = true;
-		await this.activateView(); // Show the sidebar when manual sync starts
-		this.setupSyncEngine(); // Re-setup to ensure view reference is fresh
+		if (options.revealStatus ?? true) {
+			await this.activateView();
+		}
+		this.setupSyncEngine();
 
-		new Notice('Starting Tether Sync...');
+		if (!options.silent) {
+			new Notice(`Starting Tether ${mode}...`);
+		}
 		try {
-			await this.syncEngine.sync();
+			await this.syncEngine.sync({ mode, silent: options.silent });
+			if (mode === 'pull' && this.syncEngine.stats.failed === 0 && this.syncEngine.stats.deferred.length === 0) {
+				this.settings.initialPullComplete = true;
+				await this.saveSettings();
+			}
 		} catch (error) {
-			console.error('Sync failed', error);
-			new Notice(`Sync failed: ${error instanceof Error ? error.message : String(error)}`);
+			console.error(`${mode} failed`, error);
+			if (!options.silent) {
+				new Notice(`${mode === 'pull' ? 'Pull' : 'Push'} failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
 		} finally {
 			this.isSyncing = false;
 		}
@@ -212,16 +257,8 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	async backgroundSync() {
 		if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId) return;
 		if (Date.now() - this.lastLocalChangeAt < BACKGROUND_SYNC_IDLE_DELAY_MS) return;
-		
-		this.isSyncing = true;
-		this.setupSyncEngine();
-		try {
-			await this.syncEngine.sync({ silent: true });
-		} catch (error) {
-			console.error('Background sync failed', error);
-		} finally {
-			this.isSyncing = false;
-		}
+
+		await this.runSync(this.settings.initialPullComplete ? 'push' : 'pull', { silent: true, revealStatus: false });
 	}
 
 	async startLogin() {
@@ -484,9 +521,13 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 
 		new Setting(step4)
 			.setName('Manual Sync')
-			.setDesc('Trigger a sync immediately.')
+			.setDesc(this.plugin.settings.initialPullComplete ? 'Next automatic sync will push local changes.' : 'Next automatic sync will pull from Google Drive first.')
 			.addButton(btn => btn
-				.setButtonText('Sync Now')
-				.onClick(() => this.plugin.manualSync()));
+				.setButtonText('Pull')
+				.onClick(() => this.plugin.pullSync()))
+			.addButton(btn => btn
+				.setButtonText('Push')
+				.setCta()
+				.onClick(() => this.plugin.pushSync()));
 	}
 }
