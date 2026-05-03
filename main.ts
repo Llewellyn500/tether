@@ -7,12 +7,15 @@ import { SetupGuideModal } from './ui/setup-guide';
 import { OAuthManager } from './auth/oauth';
 import { SyncStatusView, VIEW_TYPE_SYNC_STATUS } from './ui/sync-view';
 
+const BACKGROUND_SYNC_IDLE_DELAY_MS = 60000;
+
 interface GoogleDriveSyncSettings {
 	accessToken: string;
 	refreshToken: string;
 	clientId: string;
 	clientSecret: string;
 	codeVerifier: string;
+	authState: string;
 	userEmail: string;
 	folderId: string;
 	folderName: string;
@@ -26,6 +29,7 @@ const DEFAULT_SETTINGS: GoogleDriveSyncSettings = {
 	clientId: '',
 	clientSecret: '',
 	codeVerifier: '',
+	authState: '',
 	userEmail: '',
 	folderId: '',
 	folderName: '',
@@ -40,6 +44,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	syncEngine!: SyncEngine;
 	statusBarItem!: HTMLElement;
 	isSyncing: boolean = false;
+	private lastLocalChangeAt = 0;
 
 	async onload() {
 		await this.loadSettings();
@@ -50,11 +55,19 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		);
 
 		this.statusBarItem = this.addStatusBarItem();
-		this.statusBarItem.setText('☁️ GDrive: Idle');
+		this.statusBarItem.setText('GDrive: Idle');
 		this.statusBarItem.onClickEvent(() => this.activateView());
 
 		this.stateManager = new StateManager(this);
 		await this.stateManager.load();
+
+		const markLocalChange = () => {
+			this.lastLocalChangeAt = Date.now();
+		};
+		this.registerEvent(this.app.vault.on('create', markLocalChange));
+		this.registerEvent(this.app.vault.on('modify', markLocalChange));
+		this.registerEvent(this.app.vault.on('delete', markLocalChange));
+		this.registerEvent(this.app.vault.on('rename', markLocalChange));
 
 		if (this.settings.accessToken) {
 			this.initializeClient();
@@ -156,8 +169,9 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		
 		if (this.settings.folderId && this.settings.folderId !== oldFolderId) {
 			new Notice('Sync folder changed. Resetting local sync state...');
-			await this.app.vault.adapter.remove('.obsidian/gdrive-sync.json').catch(() => {});
-			if (this.stateManager) this.stateManager.state = {};
+			const statePath = this.stateManager?.getStatePath?.() ?? `${this.app.vault.configDir || '.obsidian'}/gdrive-sync.json`;
+			await this.app.vault.adapter.remove(statePath).catch(() => {});
+			if (this.stateManager) this.stateManager.clear();
 		}
 
 		if (this.settings.accessToken) {
@@ -197,11 +211,12 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 
 	async backgroundSync() {
 		if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId) return;
+		if (Date.now() - this.lastLocalChangeAt < BACKGROUND_SYNC_IDLE_DELAY_MS) return;
 		
 		this.isSyncing = true;
 		this.setupSyncEngine();
 		try {
-			await this.syncEngine.sync();
+			await this.syncEngine.sync({ silent: true });
 		} catch (error) {
 			console.error('Background sync failed', error);
 		} finally {
@@ -210,23 +225,41 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	}
 
 	async startLogin() {
+		if (!this.settings.clientId || !this.settings.clientSecret) {
+			new Notice('Add your Google client ID and secret before opening the login page.');
+			return;
+		}
+
 		const verifier = await OAuthManager.generateCodeVerifier();
+		const authState = await OAuthManager.generateCodeVerifier();
 		this.settings.codeVerifier = verifier;
+		this.settings.authState = authState;
 		await this.saveSettings();
 
 		const challenge = await OAuthManager.generateCodeChallenge(verifier);
-		const url = await OAuthManager.getAuthUrl(this.settings.clientId, challenge);
+		const url = await OAuthManager.getAuthUrl(this.settings.clientId, challenge, authState);
 		
-		window.open(url, '_blank');
+		const opened = window.open(url, '_blank');
+		if (!opened) {
+			if (navigator.clipboard) {
+				await navigator.clipboard.writeText(url).catch(() => {});
+			}
+			new Notice('Login page could not open automatically. The login URL was copied if clipboard access is available.');
+		}
 	}
 
 	async finalizeLogin(input: string) {
 		try {
-			let code = input;
-			if (input.includes('code=')) {
-				const url = input.replace('#', '?');
-				const urlParams = new URLSearchParams(url.split('?')[1]);
-				code = urlParams.get('code') || input;
+			const params = this.extractOAuthParams(input);
+			const oauthError = params.get('error');
+			if (oauthError) {
+				throw new Error(params.get('error_description') || oauthError);
+			}
+
+			let code = params.get('code') || input.trim();
+			const returnedState = params.get('state');
+			if (returnedState && this.settings.authState && returnedState !== this.settings.authState) {
+				throw new Error('Authorization response did not match this login attempt. Please start login again.');
 			}
 			code = decodeURIComponent(code);
 			
@@ -238,7 +271,9 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 			);
 			
 			this.settings.accessToken = tokens.access_token;
-			this.settings.refreshToken = tokens.refresh_token;
+			this.settings.refreshToken = tokens.refresh_token || this.settings.refreshToken;
+			this.settings.codeVerifier = '';
+			this.settings.authState = '';
 			
 			const client = new GoogleDriveClient(tokens.access_token);
 			const userInfo = await client.getUserInfo();
@@ -249,6 +284,32 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		} catch (error) {
 			console.error('Login failed', error);
 			new Notice('Login failed: ' + (error instanceof Error ? error.message : String(error)));
+		}
+	}
+
+	private extractOAuthParams(input: string): URLSearchParams {
+		const trimmed = input.trim();
+
+		try {
+			const url = new URL(trimmed);
+			const params = new URLSearchParams(url.search);
+
+			if (url.hash) {
+				const hashParams = new URLSearchParams(url.hash.slice(1));
+				hashParams.forEach((value, key) => params.set(key, value));
+			}
+
+			return params;
+		} catch (e) {
+			const normalized = trimmed.startsWith('?') || trimmed.startsWith('#')
+				? trimmed.slice(1)
+				: trimmed;
+
+			if (normalized.includes('=')) {
+				return new URLSearchParams(normalized);
+			}
+
+			return new URLSearchParams({ code: normalized });
 		}
 	}
 }
@@ -336,6 +397,8 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 					.onClick(async () => {
 						this.plugin.settings.accessToken = '';
 						this.plugin.settings.refreshToken = '';
+						this.plugin.settings.codeVerifier = '';
+						this.plugin.settings.authState = '';
 						this.plugin.settings.userEmail = '';
 						await this.plugin.saveSettings();
 						this.display();

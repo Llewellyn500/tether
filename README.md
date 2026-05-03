@@ -75,6 +75,7 @@ If you already have Tether working on another device, the easiest iOS setup is t
 
 - Tether syncs Markdown notes, attachments, nested folders, and the `.obsidian` folder.
 - Tether creates a dedicated vault folder inside the Google Drive folder you select.
+- Background sync waits briefly after local edits, defers open files, suppresses success notices, and throttles status/sidebar updates.
 - Local deletions are mirrored to Google Drive.
 - Remote deletions are mirrored back to your vault.
 - If both local and remote versions changed, Tether keeps both by creating a timestamped conflict copy.
@@ -85,7 +86,9 @@ If you already have Tether working on another device, the easiest iOS setup is t
 - Minimum Obsidian version: `0.15.0`
 - Plugin id: `tether`
 - Manifest setting: `isDesktopOnly: false`
-- Designed for desktop and mobile-compatible Obsidian environments
+- Designed for desktop and mobile-compatible Obsidian environments.
+- Sync and auth network calls use Obsidian's `requestUrl` API and avoid Node/Electron-only APIs in the mobile path.
+- Sign-in opens Google in the system browser and accepts either the redirected URL or authorization code. A fully automatic OAuth return into Obsidian on every desktop and mobile platform would require an owned HTTPS redirect flow, native platform clients, or a small backend.
 
 ## Privacy, security, and disclosures
 

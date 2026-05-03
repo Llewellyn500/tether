@@ -6,6 +6,16 @@ import { SyncStatusView, SyncStats, VIEW_TYPE_SYNC_STATUS } from '../ui/sync-vie
 
 const RECENT_LOCAL_EDIT_GRACE_MS = 5000;
 const DRAWING_LOCAL_EDIT_GRACE_MS = 30000;
+const STATE_SAVE_CHANGE_LIMIT = 40;
+const STATE_SAVE_INTERVAL_MS = 10000;
+const MANUAL_STATUS_UPDATE_MS = 500;
+const BACKGROUND_STATUS_UPDATE_MS = 3000;
+const WORK_YIELD_ITEM_LIMIT = 25;
+
+interface SyncOptions {
+	silent?: boolean;
+	statusUpdateIntervalMs?: number;
+}
 
 export class SyncEngine {
 	app: App;
@@ -14,6 +24,10 @@ export class SyncEngine {
 	folderId: string;
 	statusBarItem: HTMLElement;
 	private folderCache: Map<string, string> = new Map();
+	private silent = false;
+	private statusUpdateIntervalMs = MANUAL_STATUS_UPDATE_MS;
+	private lastStatusUpdateAt = 0;
+	private processedSinceYield = 0;
 	
 	public stats: SyncStats = {
 		totalFiles: 0,
@@ -35,27 +49,41 @@ export class SyncEngine {
 		this.statusBarItem = statusBarItem;
 	}
 
-	updateStatus(text: string, partialStats?: Partial<SyncStats>) {
-		this.statusBarItem.setText(`☁️ GDrive: ${text}`);
-		this.stats.status = text;
-		if (partialStats) {
-			this.stats = { ...this.stats, ...partialStats };
-		}
-		
-		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SYNC_STATUS);
-		if (leaves.length > 0) {
-			const view = leaves[0].view as SyncStatusView;
+	updateStatus(text: string, partialStats?: Partial<SyncStats>, force = false) {
+		this.stats = { ...this.stats, status: text, ...partialStats };
+
+		const now = Date.now();
+		const shouldRender = force ||
+			text === 'Idle' ||
+			text === 'Failed' ||
+			now - this.lastStatusUpdateAt >= this.statusUpdateIntervalMs;
+
+		if (!shouldRender) return;
+		this.lastStatusUpdateAt = now;
+
+		this.statusBarItem.setText(`GDrive: ${text}`);
+
+		const visibleLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SYNC_STATUS);
+		if (visibleLeaves.length > 0) {
+			const view = visibleLeaves[0].view as SyncStatusView;
 			if (typeof view.updateStats === 'function') {
 				view.updateStats(this.stats);
 			}
 		}
 	}
 
-	async sync() {
+	async sync(options: SyncOptions = {}) {
 		if (!this.folderId) {
 			new Notice('Google Drive folder ID not set.');
 			return;
 		}
+
+		const previousSilent = this.silent;
+		const previousStatusUpdateIntervalMs = this.statusUpdateIntervalMs;
+		this.silent = options.silent ?? false;
+		this.statusUpdateIntervalMs = options.statusUpdateIntervalMs ?? (this.silent ? BACKGROUND_STATUS_UPDATE_MS : MANUAL_STATUS_UPDATE_MS);
+		this.lastStatusUpdateAt = 0;
+		this.processedSinceYield = 0;
 
 		try {
 			this.stats.processed = 0;
@@ -64,7 +92,7 @@ export class SyncEngine {
 			this.stats.deferred = [];
 			this.folderCache.clear();
 			
-			this.updateStatus('Loading state...');
+			this.updateStatus('Loading state...', undefined, true);
 			await this.stateManager.load();
 			
 			const vaultName = this.app.vault.getName();
@@ -73,68 +101,23 @@ export class SyncEngine {
 			const vaultRootDriveId = await this.ensureVaultRoot(vaultName);
 			this.folderCache.set('', vaultRootDriveId);
 
-			this.updateStatus('Fetching remote changes...');
-			const remoteMap = await this.buildRemoteMap(vaultRootDriveId);
-			
 			this.updateStatus('Scanning local items...');
-			const localPaths = await this.listAllLocalItems('');
-			const localPathSet = new Set(localPaths);
-			this.stats.totalFiles = localPaths.length;
+			const localPathSet = await this.collectLocalPathSet('');
+			this.stats.totalFiles = localPathSet.size;
 
-			// 0. Handle Remote Deletions
-			await this.handleRemoteDeletions(remoteMap);
+			const locallyDeletedPaths = await this.handleLocalDeletions(localPathSet);
 
-			// 1. Handle Deletions
-			this.updateStatus('Checking for deletions...');
-			const stateEntries = Object.entries(this.stateManager.state);
-			for (const [path, entry] of stateEntries) {
-				if (path === '__VAULT_ROOT__' || this.isExcluded(path)) continue;
-				
-				if (!localPathSet.has(path)) {
-					try {
-						this.updateStatus(`Deleting remote: ${path}`);
-						await this.client.deleteFile(entry.driveId);
-						this.stateManager.remove(path);
-						remoteMap.delete(path);
-					} catch (e) {
-						// If already deleted or folder is gone, just remove from state
-						if (e.status === 404 || e.message?.includes('404')) {
-							this.stateManager.remove(path);
-							remoteMap.delete(path);
-						} else {
-							console.error(`Failed to delete remote ${path}`, e);
-							this.stats.failed++;
-							this.stats.errors.push({ path, message: e.message });
-						}
-					}
-				}
-			}
-
-			// 2. Pull Remote to Local
 			this.updateStatus('Pulling changes...');
-			for (const [path, remoteFile] of remoteMap.entries()) {
-				if (this.isExcluded(path)) continue;
-				try {
-					this.stats.currentFile = path;
-					await this.processRemoteFile(path, remoteFile);
-				} catch (e) {
-					console.error(`Failed to pull ${path}`, e);
-					if (e.status === 404 || e.message?.includes('404')) {
-						this.stateManager.remove(path);
-					} else {
-						this.stats.failed++;
-						this.stats.errors.push({ path, message: e.message });
-					}
-				}
-				this.updateStatus(this.stats.status);
-			}
+			const remotePathSet = new Set<string>();
+			await this.processRemoteTree(vaultRootDriveId, remotePathSet, '', 0, locallyDeletedPaths);
 
-			// 3. Push Local to Remote
+			await this.handleRemoteDeletions(remotePathSet);
+
 			this.updateStatus('Pushing changes...');
-			for (const path of localPaths) {
+			for (const path of localPathSet) {
 				this.stats.processed++;
 				this.stats.currentFile = path;
-				if (this.stats.processed % 5 === 0 || this.stats.processed === this.stats.totalFiles) {
+				if (this.stats.processed % 10 === 0 || this.stats.processed === this.stats.totalFiles) {
 					this.updateStatus(`Syncing ${this.stats.processed}/${this.stats.totalFiles}${this.stats.failed ? ` (${this.stats.failed} failed)` : ''}`);
 				}
 				
@@ -144,62 +127,130 @@ export class SyncEngine {
 					console.error(`Failed to push ${path}`, e);
 					// If the file/folder we are trying to update was deleted on remote, 
 					// clear the state so the next sync treats it as a new upload.
-					if (e.status === 404 || e.message.includes('404')) {
+					if (this.isNotFound(e)) {
 						this.stateManager.remove(path);
 						// Not a "failure" per se, just an out-of-sync state we recovered from
 					} else {
 						this.stats.failed++;
-						this.stats.errors.push({ path, message: e.message });
+						this.stats.errors.push({ path, message: this.getErrorMessage(e) });
 					}
 				}
 				this.updateStatus(this.stats.status);
+				await this.afterWorkItem();
 			}
 
 			this.stats.lastSync = new Date().toLocaleTimeString();
 			this.stats.currentFile = '';
-			this.updateStatus('Idle');
-			await this.stateManager.save();
+			await this.flushStateIfNeeded(true);
+			this.updateStatus('Idle', undefined, true);
 			
-			if (this.stats.failed > 0) {
+			if (!this.silent && this.stats.failed > 0) {
 				new Notice(`Sync complete with ${this.stats.failed} errors. Check sidebar.`);
-			} else if (this.stats.deferred.length > 0) {
+			} else if (!this.silent && this.stats.deferred.length > 0) {
 				new Notice(`Sync complete. Deferred ${this.stats.deferred.length} active file${this.stats.deferred.length === 1 ? '' : 's'} until editing stops.`);
-			} else {
+			} else if (!this.silent) {
 				new Notice('Sync complete successfully!');
 			}
 		} catch (error) {
-			this.updateStatus('Failed');
+			this.updateStatus('Failed', undefined, true);
 			console.error('Critical sync failure', error);
 			throw error;
+		} finally {
+			this.silent = previousSilent;
+			this.statusUpdateIntervalMs = previousStatusUpdateIntervalMs;
 		}
 	}
 
 	private isExcluded(path: string): boolean {
+		const statePath = this.stateManager.getStatePath();
 		return path.startsWith('.git/') || 
 			   path === '.git' || 
 			   path.startsWith('.trash/') ||
 			   path === '.trash' ||
-			   path === '.obsidian/gdrive-sync.json' ||
+			   path === statePath ||
 			   path.includes('/.git/');
 	}
 
+	private isConfigPath(path: string): boolean {
+		const configDir = this.app.vault.configDir || '.obsidian';
+		return path === configDir || path.startsWith(`${configDir}/`);
+	}
+
+	private isSameOrChildPath(path: string, parentPath: string): boolean {
+		return path === parentPath || path.startsWith(`${parentPath}/`);
+	}
+
+	private isLocallyDeletedPath(path: string, locallyDeletedPaths: Set<string>): boolean {
+		for (const deletedPath of locallyDeletedPaths) {
+			if (this.isSameOrChildPath(path, deletedPath)) return true;
+		}
+
+		return false;
+	}
+
+	private isOpenFilePath(path: string): boolean {
+		const activeFile = this.app.workspace.getActiveFile();
+		if (activeFile?.path === path) return true;
+
+		let isOpen = false;
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			const view = leaf.view as { file?: { path?: string } | null };
+			if (view.file?.path === path) {
+				isOpen = true;
+			}
+		});
+
+		return isOpen;
+	}
+
+	private async flushStateIfNeeded(force = false) {
+		if (force || this.stateManager.shouldSave(STATE_SAVE_CHANGE_LIMIT, STATE_SAVE_INTERVAL_MS)) {
+			await this.stateManager.save();
+		}
+	}
+
+	private async afterWorkItem() {
+		await this.flushStateIfNeeded();
+
+		this.processedSinceYield++;
+		if (this.processedSinceYield >= WORK_YIELD_ITEM_LIMIT) {
+			this.processedSinceYield = 0;
+			await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+		}
+	}
+
+	private isNotFound(error: unknown): boolean {
+		const status = typeof error === 'object' && error !== null && 'status' in error
+			? (error as { status?: number }).status
+			: undefined;
+		return status === 404 || this.getErrorMessage(error).includes('404');
+	}
+
+	private getErrorMessage(error: unknown): string {
+		return error instanceof Error ? error.message : String(error);
+	}
+
 	private async listAllLocalItems(folderPath: string): Promise<string[]> {
-		const items: string[] = [];
+		return Array.from(await this.collectLocalPathSet(folderPath));
+	}
+
+	private async collectLocalPathSet(folderPath: string, items: Set<string> = new Set()): Promise<Set<string>> {
 		const result = await this.app.vault.adapter.list(folderPath);
 		
 		for (const file of result.files) {
 			if (!this.isExcluded(file)) {
-				items.push(file);
+				items.add(file);
 			}
 		}
 		
 		for (const folder of result.folders) {
 			if (!this.isExcluded(folder)) {
-				items.push(folder);
-				const subItems = await this.listAllLocalItems(folder);
-				items.push(...subItems);
+				items.add(folder);
+				await this.collectLocalPathSet(folder, items);
 			}
+			await this.afterWorkItem();
 		}
+
 		return items;
 	}
 
@@ -236,7 +287,7 @@ export class SyncEngine {
 				etag: ''
 			});
 			await this.deferIfChangedAfterUpload(path, upload.stat);
-			await this.stateManager.save();
+			await this.flushStateIfNeeded();
 		} else if (stat.mtime > state.lastSyncedMtime) {
 			const upload = await this.readStableLocalFile(path, stat);
 			if (!upload) return;
@@ -248,7 +299,7 @@ export class SyncEngine {
 				remoteMtime: remoteFile.modifiedTime
 			});
 			await this.deferIfChangedAfterUpload(path, upload.stat);
-			await this.stateManager.save();
+			await this.flushStateIfNeeded();
 		}
 	}
 
@@ -279,7 +330,7 @@ export class SyncEngine {
 				etag: ''
 			});
 			this.folderCache.set(path, existing.id);
-			await this.stateManager.save();
+			await this.flushStateIfNeeded();
 			return existing.id;
 		}
 
@@ -291,37 +342,58 @@ export class SyncEngine {
 			etag: ''
 		});
 		this.folderCache.set(path, remoteFolder.id);
-		await this.stateManager.save();
+		await this.flushStateIfNeeded();
 
 		return remoteFolder.id;
 	}
 
-	private async buildRemoteMap(folderId: string, parentPath: string = '', depth: number = 0): Promise<Map<string, DriveFile>> {
+	private async processRemoteTree(folderId: string, remotePathSet: Set<string>, parentPath: string = '', depth: number = 0, locallyDeletedPaths: Set<string> = new Set()): Promise<void> {
 		if (depth > 50) throw new Error('Maximum folder depth reached.');
-		
-		const map = new Map<string, DriveFile>();
 		this.updateStatus(`Scanning Drive: ${parentPath || 'root'}...`);
 		
 		try {
-			const items = await this.client.listFiles(folderId);
+			let pageToken: string | undefined;
 
-			for (const item of items) {
-				const path = parentPath ? `${parentPath}/${item.name}` : item.name;
-				if (item.mimeType === 'application/vnd.google-apps.folder') {
-					map.set(path, item);
-					const subMap = await this.buildRemoteMap(item.id, path, depth + 1);
-					for (const [subPath, subFile] of subMap) {
-						map.set(subPath, subFile);
+			do {
+				const page = await this.client.listFilesPage(folderId, pageToken);
+
+				for (const item of page.files) {
+					const path = parentPath ? `${parentPath}/${item.name}` : item.name;
+					if (this.isLocallyDeletedPath(path, locallyDeletedPaths)) {
+						continue;
 					}
-				} else {
-					map.set(path, item);
+
+					remotePathSet.add(path);
+
+					if (this.isExcluded(path)) continue;
+
+					try {
+						this.stats.currentFile = path;
+						await this.processRemoteFile(path, item);
+					} catch (e) {
+						console.error(`Failed to pull ${path}`, e);
+						if (this.isNotFound(e)) {
+							this.stateManager.remove(path);
+						} else {
+							this.stats.failed++;
+							this.stats.errors.push({ path, message: this.getErrorMessage(e) });
+						}
+					}
+
+					this.updateStatus(this.stats.status);
+					await this.afterWorkItem();
+
+					if (item.mimeType === 'application/vnd.google-apps.folder') {
+						await this.processRemoteTree(item.id, remotePathSet, path, depth + 1, locallyDeletedPaths);
+					}
 				}
-			}
+
+				pageToken = page.nextPageToken;
+			} while (pageToken);
 		} catch (error) {
 			console.error(`Failed to scan Drive folder ${folderId}`, error);
 			throw error;
 		}
-		return map;
 	}
 
 	private async ensureVaultRoot(name: string): Promise<string> {
@@ -335,14 +407,14 @@ export class SyncEngine {
 		if (existing) {
 			const entry = { driveId: existing.id, lastSyncedMtime: 0, remoteMtime: existing.modifiedTime, etag: '' };
 			this.stateManager.set(stateKey, entry);
-			await this.stateManager.save();
+			await this.flushStateIfNeeded(true);
 			return existing.id;
 		}
 
 		const newFolder = await this.client.createFolder(name, this.folderId);
 		const entry = { driveId: newFolder.id, lastSyncedMtime: 0, remoteMtime: newFolder.modifiedTime, etag: '' };
 		this.stateManager.set(stateKey, entry);
-		await this.stateManager.save();
+		await this.flushStateIfNeeded(true);
 		return newFolder.id;
 	}
 
@@ -356,7 +428,7 @@ export class SyncEngine {
 				remoteMtime: remoteFile.modifiedTime,
 				etag: ''
 			});
-			await this.stateManager.save();
+			await this.flushStateIfNeeded();
 			return;
 		}
 
@@ -370,7 +442,7 @@ export class SyncEngine {
 
 		if (!state) {
 			if (existsLocal) {
-				if (path.startsWith('.obsidian/') && localStat) {
+				if (this.isConfigPath(path) && localStat) {
 					const remoteTime = new Date(remoteFile.modifiedTime).getTime();
 					if (remoteTime > localStat.mtime) {
 						await this.download(path, remoteFile);
@@ -383,7 +455,7 @@ export class SyncEngine {
 							remoteMtime: remoteFile.modifiedTime,
 							etag: ''
 						});
-						await this.stateManager.save();
+						await this.flushStateIfNeeded();
 					}
 				} else {
 					await this.handleConflict(path, remoteFile);
@@ -393,7 +465,7 @@ export class SyncEngine {
 			}
 		} else if (remoteFile.modifiedTime !== state.remoteMtime) {
 			if (localStat && localStat.mtime > state.lastSyncedMtime) {
-				if (path.startsWith('.obsidian/')) {
+				if (this.isConfigPath(path)) {
 					const remoteTime = new Date(remoteFile.modifiedTime).getTime();
 					if (remoteTime > localStat.mtime) {
 						await this.download(path, remoteFile);
@@ -404,7 +476,7 @@ export class SyncEngine {
 							...state,
 							remoteMtime: remoteFile.modifiedTime
 						});
-						await this.stateManager.save();
+						await this.flushStateIfNeeded();
 					}
 				} else {
 					await this.handleConflict(path, remoteFile);
@@ -415,7 +487,41 @@ export class SyncEngine {
 		}
 	}
 
-	private async handleRemoteDeletions(remoteMap: Map<string, DriveFile>) {
+	private async handleLocalDeletions(localPathSet: Set<string>): Promise<Set<string>> {
+		this.updateStatus('Checking for deletions...');
+		const stateEntries = Object.entries(this.stateManager.state);
+		const locallyDeletedPaths = new Set<string>();
+
+		for (const [path, entry] of stateEntries) {
+			if (path === '__VAULT_ROOT__' || this.isExcluded(path)) continue;
+
+			if (!localPathSet.has(path)) {
+				try {
+					this.updateStatus(`Deleting remote: ${path}`);
+					await this.client.deleteFile(entry.driveId);
+					this.stateManager.remove(path);
+					locallyDeletedPaths.add(path);
+					await this.flushStateIfNeeded();
+				} catch (e) {
+					if (this.isNotFound(e)) {
+						this.stateManager.remove(path);
+						locallyDeletedPaths.add(path);
+						await this.flushStateIfNeeded();
+					} else {
+						console.error(`Failed to delete remote ${path}`, e);
+						this.stats.failed++;
+						this.stats.errors.push({ path, message: this.getErrorMessage(e) });
+					}
+				}
+
+				await this.afterWorkItem();
+			}
+		}
+
+		return locallyDeletedPaths;
+	}
+
+	private async handleRemoteDeletions(remotePathSet: Set<string>) {
 		const stateEntries = Object.entries(this.stateManager.state);
 		// Sort by path length descending to handle children before parents
 		const sortedEntries = stateEntries
@@ -423,11 +529,16 @@ export class SyncEngine {
 			.sort((a, b) => b[0].length - a[0].length);
 
 		for (const [path, entry] of sortedEntries) {
-			if (!remoteMap.has(path)) {
+			if (!remotePathSet.has(path)) {
 				try {
 					if (await this.app.vault.adapter.exists(path)) {
 						this.updateStatus(`Deleting local: ${path}`);
 						const stat = await this.app.vault.adapter.stat(path);
+						if (stat?.type === 'file' && this.isOpenFilePath(path)) {
+							this.addDeferredFile(path, 'open in Obsidian');
+							continue;
+						}
+
 						if (stat?.type === 'file' && stat.mtime > entry.lastSyncedMtime) {
 							if (await this.shouldDeferActiveLocalFile(path, stat)) {
 								this.stateManager.remove(path);
@@ -445,11 +556,11 @@ export class SyncEngine {
 
 							// Use rmdir for folders. Recursive: false because we handle children individually
 							// due to the sorted loop.
-							await (this.app.vault.adapter as any).rmdir(path, false).catch(async (err: any) => {
+							await this.app.vault.adapter.rmdir(path, false).catch(async () => {
 								// If rmdir fails because it's not empty (shouldn't happen with our sorting, 
 								// but safety first), try recursive if it's not a critical folder.
-								if (!path.startsWith('.obsidian/')) {
-									await (this.app.vault.adapter as any).rmdir(path, true);
+								if (!this.isConfigPath(path)) {
+									await this.app.vault.adapter.rmdir(path, true);
 								}
 							});
 						} else {
@@ -457,10 +568,11 @@ export class SyncEngine {
 						}
 					}
 					this.stateManager.remove(path);
+					await this.flushStateIfNeeded();
 				} catch (e) {
 					console.error(`Failed to delete local ${path}`, e);
 					this.stats.failed++;
-					this.stats.errors.push({ path, message: e.message });
+					this.stats.errors.push({ path, message: this.getErrorMessage(e) });
 				}
 			}
 		}
@@ -484,7 +596,7 @@ export class SyncEngine {
 			remoteMtime: remoteFile.modifiedTime,
 			etag: ''
 		});
-		await this.stateManager.save();
+		await this.flushStateIfNeeded();
 	}
 
 	private async ensureLocalPath(path: string) {
@@ -498,7 +610,7 @@ export class SyncEngine {
 		try {
 			await this.app.vault.adapter.mkdir(path);
 		} catch (e) {
-			const msg = (e.message || e.toString()).toLowerCase();
+			const msg = this.getErrorMessage(e).toLowerCase();
 			if (!msg.includes('already exists')) {
 				throw e;
 			}
@@ -522,7 +634,9 @@ export class SyncEngine {
 
 		await this.app.vault.adapter.writeBinary(conflictPath, content);
 		
-		new Notice(`Conflict detected for ${path}. Kept both versions.`);
+		if (!this.silent) {
+			new Notice(`Conflict detected for ${path}. Kept both versions.`);
+		}
 		
 		this.stats.conflicts.push({
 			path: conflictPath,
@@ -537,7 +651,7 @@ export class SyncEngine {
 			remoteMtime: remoteFile.modifiedTime,
 			etag: ''
 		});
-		await this.stateManager.save();
+		await this.flushStateIfNeeded();
 	}
 
 	private async hasUnsyncedLocalDescendant(folderPath: string): Promise<boolean> {
@@ -560,6 +674,11 @@ export class SyncEngine {
 	private async shouldDeferActiveLocalFile(path: string, stat?: Stat | null): Promise<boolean> {
 		const localStat = stat ?? await this.app.vault.adapter.stat(path);
 		if (!localStat || localStat.type !== 'file') return false;
+
+		if (this.isOpenFilePath(path)) {
+			this.addDeferredFile(path, 'open in Obsidian');
+			return true;
+		}
 
 		const graceMs = this.getLocalEditGraceMs(path);
 		const ageMs = Date.now() - localStat.mtime;

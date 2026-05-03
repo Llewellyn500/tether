@@ -9,6 +9,11 @@ export interface DriveFile {
 	size?: string;
 }
 
+export interface DriveFilePage {
+	files: DriveFile[];
+	nextPageToken?: string;
+}
+
 export class GoogleDriveClient {
 	accessToken: string;
 	onTokenRefresh?: (tokens: any) => Promise<void>;
@@ -30,7 +35,9 @@ export class GoogleDriveClient {
 		try {
 			response = await requestUrl(options);
 		} catch (error: unknown) {
-			const status = error instanceof Object && 'status' in error ? (error as any).status : undefined;
+			const status = typeof error === 'object' && error !== null && 'status' in error
+				? (error as { status?: number }).status
+				: undefined;
 			if (status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
 				return await this.handleRefresh(options);
 			}
@@ -84,13 +91,15 @@ export class GoogleDriveClient {
 		let files: DriveFile[] = [];
 		let pageToken: string | undefined;
 		do {
-			const q = `'${folderId}' in parents and trashed = false`;
-			const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum,size)${pageToken ? `&pageToken=${pageToken}` : ''}`;
-			const response = await this.request({ url, method: 'GET' });
-			files = files.concat(response.json.files || []);
-			pageToken = response.json.nextPageToken;
+			const page = await this.listFilesPage(folderId, pageToken);
+			files = files.concat(page.files);
+			pageToken = page.nextPageToken;
 		} while (pageToken);
 		return files;
+	}
+
+	async listFilesPage(folderId: string, pageToken?: string): Promise<DriveFilePage> {
+		return this.listChildrenPage(folderId, false, pageToken);
 	}
 
 	async downloadFile(fileId: string): Promise<ArrayBuffer> {
@@ -103,13 +112,45 @@ export class GoogleDriveClient {
 		let files: DriveFile[] = [];
 		let pageToken: string | undefined;
 		do {
-			const q = `'${parentId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
-			const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=nextPageToken,files(id,name,mimeType,modifiedTime)${pageToken ? `&pageToken=${pageToken}` : ''}`;
-			const response = await this.request({ url, method: 'GET' });
-			files = files.concat(response.json.files || []);
-			pageToken = response.json.nextPageToken;
+			const page = await this.listFoldersPage(parentId, pageToken);
+			files = files.concat(page.files);
+			pageToken = page.nextPageToken;
 		} while (pageToken);
 		return files;
+	}
+
+	async listFoldersPage(parentId: string = 'root', pageToken?: string): Promise<DriveFilePage> {
+		return this.listChildrenPage(parentId, true, pageToken);
+	}
+
+	private async listChildrenPage(parentId: string, foldersOnly: boolean, pageToken?: string): Promise<DriveFilePage> {
+		const folderMimeType = 'application/vnd.google-apps.folder';
+		const qParts = [`'${parentId}' in parents`, 'trashed = false'];
+		if (foldersOnly) {
+			qParts.push(`mimeType = '${folderMimeType}'`);
+		}
+
+		const params = new URLSearchParams({
+			q: qParts.join(' and '),
+			fields: 'nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum,size)',
+			pageSize: '100',
+			corpora: 'user',
+			spaces: 'drive'
+		});
+
+		if (pageToken) {
+			params.set('pageToken', pageToken);
+		}
+
+		const response = await this.request({
+			url: `https://www.googleapis.com/drive/v3/files?${params.toString()}`,
+			method: 'GET'
+		});
+
+		return {
+			files: response.json.files || [],
+			nextPageToken: response.json.nextPageToken
+		};
 	}
 
 	async createFolder(name: string, parentId?: string): Promise<DriveFile> {

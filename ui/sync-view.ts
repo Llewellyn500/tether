@@ -93,7 +93,7 @@ export class SyncStatusView extends ItemView {
 						const file = this.app.vault.getAbstractFileByPath(conflict.path);
 						if (file instanceof TFile) {
 							await this.app.workspace.getLeaf(true).openFile(file);
-						} else if (conflict.path.startsWith('.obsidian/')) {
+						} else if (this.isConfigPath(conflict.path)) {
 							new Notice('Cannot open hidden config files directly in the editor. Please use an external editor or a File Explorer plugin to view this file.');
 						} else {
 							await this.app.workspace.openLinkText(conflict.path, '', true);
@@ -145,5 +145,10 @@ export class SyncStatusView extends ItemView {
 		const stat = parent.createDiv({ cls: 'sync-stat' });
 		stat.createDiv({ text: label, cls: 'stat-label' });
 		stat.createDiv({ text: value, cls: 'stat-value ' + cls });
+	}
+
+	private isConfigPath(path: string): boolean {
+		const configDir = this.app.vault.configDir || '.obsidian';
+		return path === configDir || path.startsWith(`${configDir}/`);
 	}
 }

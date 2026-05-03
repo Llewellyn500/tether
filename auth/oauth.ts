@@ -17,16 +17,20 @@ export class OAuthManager {
 		return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 	}
 
-	static async getAuthUrl(clientId: string, codeChallenge: string) {
-		return `https://accounts.google.com/o/oauth2/v2/auth?` + 
-			`client_id=${clientId}&` +
-			`redirect_uri=${encodeURIComponent(REDIRECT_URI)}&` +
-			`response_type=code&` +
-			`scope=${encodeURIComponent(SCOPES)}&` +
-			`code_challenge=${codeChallenge}&` +
-			`code_challenge_method=S256&` +
-			`access_type=offline&` +
-			`prompt=consent`;
+	static async getAuthUrl(clientId: string, codeChallenge: string, state: string) {
+		const params = new URLSearchParams({
+			client_id: clientId.trim(),
+			redirect_uri: REDIRECT_URI,
+			response_type: 'code',
+			scope: SCOPES,
+			code_challenge: codeChallenge,
+			code_challenge_method: 'S256',
+			access_type: 'offline',
+			prompt: 'consent',
+			state
+		});
+
+		return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
 	}
 
 	static async exchangeCodeForToken(code: string, codeVerifier: string, clientId: string, clientSecret: string) {
