@@ -105,6 +105,17 @@ If you already have Tether working on another device, the easiest iOS setup is t
 - No ads, telemetry, or third-party analytics are used in the current plugin code.
 - Tether is not affiliated with Google or Obsidian.
 
+### Disclosures
+
+- Plugin might make requests to 5 external domains: `accounts.google.com`, `oauth2.googleapis.com`, `obsidian.md`, `raw.githubusercontent.com`, and `www.googleapis.com`.
+- Clipboard access: reads or writes the system clipboard, which may expose content the user copied from outside Obsidian.
+- Found `atob()`/`btoa()` base64 calls (2 total), which may be used to obscure strings.
+- Vault read: reads individual vault files via the Obsidian API (`vault.read`, `vault.cachedRead`).
+- Vault write: creates or modifies vault files via the Obsidian API (`vault.modify`, `vault.create`, etc.).
+- Malware scan not available.
+- Obfuscation scan not available.
+- Network requests scan not available.
+
 ## Full Google Cloud setup
 
 Tether includes an in-app setup guide with screenshots. If you prefer a GitHub-readable version, expand the walkthrough below.
